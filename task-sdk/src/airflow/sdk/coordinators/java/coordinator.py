@@ -34,6 +34,7 @@ from airflow.sdk.coordinators._bundle_metadata import (
     validate_schema_version,
 )
 from airflow.sdk.coordinators._subprocess import SubprocessCoordinator
+from airflow.sdk.coordinators.java._dag_importer import JavaDagImporter
 from airflow.sdk.coordinators.java._jar_manifest import read_main_attributes
 
 if TYPE_CHECKING:
@@ -190,6 +191,11 @@ class JavaCoordinator(SubprocessCoordinator):
     dependency JARs are deployed as-is. If you repackage the dependencies,
     however, you must also reproduce the metadata entry in one of the JARs.
 
+    Without *jars_root*, the coordinator also parses native Java Dags: every JAR
+    in the Dag bundle it reads whose manifest sets Main-Class (matching
+    *main_class* when that is set) is run to list the Dags its main class
+    declares.
+
     The default *task_startup_timeout* should plenty long enough since a task-
     containing JAR is not supposed to consume significant time to perform setup
     (it should happen in individual tasks instead). However, if the launch time
@@ -209,6 +215,9 @@ class JavaCoordinator(SubprocessCoordinator):
     @property
     def _explicit_artifact_roots(self) -> tuple[str, list[pathlib.Path]]:
         return "jars_root", self.jars_root
+
+    def get_dag_importer(self) -> JavaDagImporter:
+        return JavaDagImporter(coordinator=self)
 
     def _build_command(self, roots: Sequence[pathlib.Path], main_class: str) -> list[str]:
         return [self.java_executable, "-classpath", _calculate_classpath(roots), *self.jvm_args, main_class]
