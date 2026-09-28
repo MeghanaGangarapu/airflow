@@ -20,6 +20,7 @@ from __future__ import annotations
 import contextlib
 import os
 import pathlib
+import signal
 import socket
 import subprocess
 import sys
@@ -1148,10 +1149,13 @@ class TestParseDag:
         with pytest.raises(NotImplementedError):
             _StubSubprocessCoordinator(command=["x"])._build_parse_dag_command(path=tmp_path / "dag.native")
 
+    @patch("airflow.sdk.coordinators._subprocess.signal.signal", autospec=True)
     @patch(
         "airflow.sdk.coordinators._subprocess.os.execvpe", autospec=True, side_effect=OSError("exec failed")
     )
-    def test_resolves_the_command_under_the_bundle_root_then_execs_it(self, mock_execvpe, tmp_path):
+    def test_resolves_the_command_under_the_bundle_root_then_execs_it(
+        self, mock_execvpe, mock_signal, tmp_path
+    ):
         coordinator = _ParsingCoordinator(command=["runtime"], explicit_roots=[], schema_version="2026-06-16")
         reported: list[str | None] = []
 
@@ -1175,9 +1179,12 @@ class TestParseDag:
         ]
         mock_execvpe.assert_called_once_with("runtime", argv, ANY)
         assert "AIRFLOW__LOGGING__LOGGING_LEVEL" in mock_execvpe.call_args.args[2]
+        restored = {c.args[0] for c in mock_signal.call_args_list if c.args[1] == signal.SIG_DFL}
+        assert {signal.SIGPIPE, signal.SIGXFSZ} <= restored
 
+    @patch("airflow.sdk.coordinators._subprocess.signal.signal", autospec=True)
     @patch("airflow.sdk.coordinators._subprocess.os.execvpe", autospec=True)
-    def test_rejects_an_unknown_schema_version_before_reporting(self, mock_execvpe, tmp_path):
+    def test_rejects_an_unknown_schema_version_before_reporting(self, mock_execvpe, mock_signal, tmp_path):
         coordinator = _ParsingCoordinator(command=["runtime"], explicit_roots=[], schema_version="1999-01-01")
         reported: list[str | None] = []
 

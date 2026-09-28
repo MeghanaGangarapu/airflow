@@ -2774,6 +2774,17 @@ class TestLangSDKDagFileProcessorProcess:
         assert error in message
         assert proc._exit_code == -signal.SIGKILL
 
+    @pytest.mark.skipif(not pathlib.Path("/proc/self/status").exists(), reason="reads /proc")
+    def test_the_runtime_starts_with_default_signal_dispositions(self, start, selector, tmp_path):
+        report = tmp_path / "signals.txt"
+        proc = start(dags=["native_dag"], signal_report=str(report))
+
+        _service_until_ready(proc, selector)
+
+        ignored = int(report.read_text().split()[1], 16)
+        assert [sig for sig in (signal.SIGPIPE, signal.SIGXFSZ) if ignored & (1 << (sig - 1))] == []
+        assert [dag.dag_id for dag in proc.parsing_result.serialized_dags] == ["native_dag"]
+
     def test_a_second_result_is_rejected(self, start, selector, tmp_path):
         reply_file = tmp_path / "second_reply.json"
         proc = start(dags=["first_dag"], second_result=["second_dag"], second_reply_file=str(reply_file))

@@ -611,6 +611,11 @@ class SubprocessCoordinator(BaseCoordinator):
             f"--logs={logs_address[0]}:{logs_address[1]}",
         ]
         report_schema_version(schema_version)
+        # Python ignores these at startup and exec keeps ignored signals; subprocess.Popen resets
+        # them the same way for the task runtime.
+        for name in ("SIGPIPE", "SIGXFZ", "SIGXFSZ"):
+            if (sig := getattr(signal, name, None)) is not None:
+                signal.signal(sig, signal.SIG_DFL)
         os.execvpe(argv[0], argv, _build_runtime_env())
 
     @contextlib.contextmanager

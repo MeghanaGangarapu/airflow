@@ -49,7 +49,8 @@ class FakeCoordinator(SubprocessCoordinator):
     Parse ``.native`` files with the fake runtime.
 
     The file names the command's schema version, or a ``command_error`` to raise instead. With
-    ``launcher``, a shell starts the runtime as its child.
+    ``launcher``, a shell starts the runtime as its child; with ``signal_report``, a shell records the
+    signals it ignores in that file before it becomes the runtime.
     """
 
     def _build_parse_dag_command(self, *, path: Path) -> tuple[list[str], str | None]:
@@ -60,6 +61,10 @@ class FakeCoordinator(SubprocessCoordinator):
         if spec.get("launcher"):
             # A shell that starts the runtime as its child and waits for it.
             command = ["/bin/sh", "-c", f'{shlex.join(command)} "$@" & wait', "fake-launcher"]
+        elif report := spec.get("signal_report"):
+            # A shell that records the signals it was started with, then becomes the runtime.
+            script = f'grep ^SigIgn: /proc/$$/status > {shlex.quote(report)}; exec {shlex.join(command)} "$@"'
+            command = ["/bin/sh", "-c", script, "fake-launcher"]
         return command, spec.get("schema_version", SCHEMA_VERSION)
 
     def get_dag_importer(self) -> FakeCoordinatorDagImporter:
