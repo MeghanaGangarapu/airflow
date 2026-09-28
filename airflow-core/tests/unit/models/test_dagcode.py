@@ -327,20 +327,26 @@ class TestClaimedFileSource:
             == "class Main { int v2; }\n"
         )
 
-    def test_python_file_does_not_build_a_registry(self):
-        with (
-            patch("airflow.dag_processing.importer_routing.get_task_sdk_registry") as get_registry,
-            patch.object(DagCode, "get_code_from_file", return_value="# code") as read_file,
-        ):
-            assert DagCode._read_source("/bundle/dag.py", "testing") == "# code"
+    @patch.object(DagCode, "get_code_from_file", autospec=True, return_value="# code")
+    @patch("airflow.dag_processing.importer_routing.get_task_sdk_registry", autospec=True)
+    def test_python_file_does_not_build_a_registry(self, get_registry, read_file):
+        assert DagCode._read_source("/bundle/dag.py", "testing") == "# code"
 
         get_registry.assert_not_called()
         read_file.assert_called_once_with("/bundle/dag.py")
 
+    def test_empty_importer_source_stores_a_placeholder(self, tmp_path, session):
+        jar = write_jar(tmp_path / "native.jar", "native_dag", source="")
+
+        with task_sdk_importers(JAR_IMPORTER):
+            sync_dag_to_db(self._native_dag(jar), session=session)
+
+        assert DagCode.get_latest_dagcode("native_dag", session=session).source_code == SOURCE_UNAVAILABLE
+
     def test_unclaimed_file_is_read_from_disk(self):
         with (
             task_sdk_importers(),
-            patch.object(DagCode, "get_code_from_file", return_value="notes") as read_file,
+            patch.object(DagCode, "get_code_from_file", autospec=True, return_value="notes") as read_file,
         ):
             assert DagCode._read_source("/bundle/notes.txt", "testing") == "notes"
 

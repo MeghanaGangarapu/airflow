@@ -68,7 +68,7 @@ class BundleRef:
     path: Path | None
 
 
-def _as_bundle(bundle: BaseDagBundle | BundleRef) -> BaseDagBundle:
+def _cast_to_bundle(bundle: BaseDagBundle | BundleRef) -> BaseDagBundle:
     return cast("BaseDagBundle", bundle)
 
 
@@ -104,7 +104,7 @@ def is_claimed(registry: DagImporterRegistry, path: str | os.PathLike[str]) -> b
     return get_file_suffix(Path(path)) in _get_claimed_extensions(registry)
 
 
-def claimed_importer(
+def get_claiming_importer(
     registry: DagImporterRegistry, path: str | os.PathLike[str]
 ) -> AbstractDagImporter[Any] | None:
     """
@@ -117,11 +117,11 @@ def claimed_importer(
     return registry.get_importer(Path(path))
 
 
-def _claimed_importer_or_none(
+def _get_claiming_importer_or_none(
     registry: DagImporterRegistry, path: str | os.PathLike[str]
 ) -> AbstractDagImporter[Any] | None:
     try:
-        return claimed_importer(registry, path)
+        return get_claiming_importer(registry, path)
     except Exception as e:
         log.warning("Cannot load the Dag importer for %s: %s", path, e)
         return None
@@ -134,7 +134,7 @@ def _group_claiming_importers(
     groups: list[tuple[AbstractDagImporter[Any] | None, list[str]]] = []
     for ext in _get_claimed_extensions(registry):
         # Any file name works: the registry routes by its suffix.
-        importer = _claimed_importer_or_none(registry, f"_{ext}")
+        importer = _get_claiming_importer_or_none(registry, f"_{ext}")
         group = next((g for g in groups if importer is not None and g[0] is importer), None)
         if group is None:
             groups.append((importer, [ext]))
@@ -165,7 +165,7 @@ def _get_listed_path(
     else:
         log.warning("Skipping %r: %s did not list a file", item, type(importer).__name__)
         return None
-    return path if _claimed_importer_or_none(registry, path) is importer else None
+    return path if _get_claiming_importer_or_none(registry, path) is importer else None
 
 
 def merge_claimed_paths(
@@ -183,12 +183,12 @@ def merge_claimed_paths(
     or raises while listing, every file with its extensions is kept: parsing each one then reports
     the failure, instead of the files' Dags being treated as deleted.
     """
-    bundle_path = _as_bundle(bundle).path
+    bundle_path = _cast_to_bundle(bundle).path
     claimed_paths: dict[str, None] = {}
     for importer, extensions in _group_claiming_importers(registry):
         if importer is not None:
             try:
-                for item in importer.list_dag_definitions(_as_bundle(bundle), safe_mode=safe_mode):
+                for item in importer.list_dag_definitions(_cast_to_bundle(bundle), safe_mode=safe_mode):
                     if (path := _get_listed_path(registry, importer, item)) is not None:
                         claimed_paths.setdefault(os.fspath(path))
                 continue
@@ -199,7 +199,7 @@ def merge_claimed_paths(
     return [path for path in legacy_paths if not is_claimed(registry, path)] + list(claimed_paths)
 
 
-def _failed_result(source_reference: str, error: Exception) -> DagImportResult:
+def _build_failed_result(source_reference: str, error: Exception) -> DagImportResult:
     return DagImportResult(
         errors=[DagImportError(source_reference=source_reference, message=f"{type(error).__name__}: {error}")]
     )
@@ -223,15 +223,15 @@ def iter_claimed_results(
     try:
         items = list(
             importer.list_dag_definitions(
-                _as_bundle(BundleRef(name=bundle_name, path=file_path)), safe_mode=safe_mode
+                _cast_to_bundle(BundleRef(name=bundle_name, path=file_path)), safe_mode=safe_mode
             )
         )
     except Exception as e:
         log.exception("Cannot list the Dag definitions in %s", file_path)
-        yield _failed_result(str(file_path), e)
+        yield _build_failed_result(str(file_path), e)
         return
 
-    bundle = _as_bundle(BundleRef(name=bundle_name, path=bundle_path))
+    bundle = _cast_to_bundle(BundleRef(name=bundle_name, path=bundle_path))
     for item in items:
         if isinstance(item, DagImportError):
             yield DagImportResult(errors=[item])
@@ -240,7 +240,7 @@ def iter_claimed_results(
             result = importer.import_definition(item, bundle)
         except Exception as e:
             log.exception("Cannot import the Dag definition %r", item)
-            result = _failed_result(repr(item), e)
+            result = _build_failed_result(repr(item), e)
         yield result
 
 
@@ -253,6 +253,6 @@ def read_claimed_source(fileloc: str, bundle_name: str | None) -> str | None:
     :raises Exception: whatever the importer raises while loading or reading the source.
     """
     registry = get_task_sdk_registry(bundle_name)
-    if registry is None or (importer := claimed_importer(registry, fileloc)) is None:
+    if registry is None or (importer := get_claiming_importer(registry, fileloc)) is None:
         return None
     return importer.get_source_code(FilesystemDagDefinition(Path(fileloc))).source_code

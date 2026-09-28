@@ -34,7 +34,7 @@ from airflow._shared.timezones import timezone
 from airflow.configuration import conf
 from airflow.dag_processing.importer_routing import (
     BundleRef,
-    claimed_importer,
+    get_claiming_importer,
     get_task_sdk_registry,
     has_claiming_importers,
     is_claimed,
@@ -326,7 +326,7 @@ class DagBag(LoggingMixin):
 
         if (task_sdk_registry := get_task_sdk_registry(self.bundle_name)) is not None:
             try:
-                task_sdk_importer = claimed_importer(task_sdk_registry, filepath)
+                task_sdk_importer = get_claiming_importer(task_sdk_registry, filepath)
             except Exception as e:
                 self.log.exception("Cannot load the Dag importer for %s", filepath)
                 self.import_errors[self._get_error_key(filepath)] = f"{type(e).__name__}: {e}"
@@ -495,10 +495,10 @@ class DagBag(LoggingMixin):
 
     def _get_error_key(self, source_reference: str) -> str:
         """Key an import error by its path relative to the bundle, or as is when outside it."""
-        if self.bundle_path:
-            with contextlib.suppress(ValueError):
-                return str(Path(source_reference).relative_to(self.bundle_path))
-        return source_reference
+        try:
+            return self._get_relative_fileloc(source_reference)
+        except ValueError:
+            return source_reference
 
     def bag_dag(self, dag: DAG):
         """

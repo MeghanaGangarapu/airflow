@@ -1544,8 +1544,8 @@ class TestClaimedFiles:
 
         with (
             task_sdk_importers(importer_config),
-            mock.patch.object(TaskSdkPythonDagImporter, "import_definition") as python_import,
-            mock.patch.object(ZipImporter, "import_definition") as zip_import,
+            mock.patch.object(TaskSdkPythonDagImporter, "import_definition", autospec=True) as python_import,
+            mock.patch.object(ZipImporter, "import_definition", autospec=True) as zip_import,
         ):
             dagbag = DagBag(dag_folder=os.fspath(tmp_path), bundle_path=tmp_path, bundle_name="testing")
 

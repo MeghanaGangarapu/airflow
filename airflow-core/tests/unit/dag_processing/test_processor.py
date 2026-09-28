@@ -707,7 +707,7 @@ def test_parse_file_through_a_claiming_importer(tmp_path):
 
     with (
         task_sdk_importers(FAKE_IMPORTER),
-        patch("airflow.dag_processing.processor.check_dag_file_stability") as stability_check,
+        patch("airflow.dag_processing.processor.check_dag_file_stability", autospec=True) as stability_check,
     ):
         result = _parse_file(
             DagFileParseRequest(file=str(claimed), bundle_path=tmp_path, bundle_name="testing"),
