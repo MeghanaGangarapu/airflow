@@ -724,12 +724,21 @@ def _setup_ts_sdk_integration(dot_env_file, tmp_dir):
     ts_bundles_dir.mkdir()
     # Deliberately renamed: the coordinator routes on embedded metadata, not on a fixed name.
     copyfile(TS_SDK_EXAMPLE_PATH / "dist" / "bundle.min.mjs", ts_bundles_dir / "example.min.mjs")
+    # The same artifact inside the Dag bundle, where the Dag processor finds its native Dag.
+    (tmp_dir / "dags" / "typescript").mkdir()
+    copyfile(
+        TS_SDK_EXAMPLE_PATH / "dist" / "bundle.min.mjs", tmp_dir / "dags" / "typescript" / "example.min.mjs"
+    )
 
     # Both of the example bundle's Dags: one bundle.mjs provides for two dag_ids,
     # and the tests check that dispatch tells their same-named tasks apart.
     for dag_file in ("typescript_example.py", "typescript_taskflow_example.py"):
         copyfile(TS_SDK_EXAMPLE_PATH / "dags" / dag_file, tmp_dir / "dags" / dag_file)
 
+    # "ts" runs every TypeScript task, stub or native, from /opt/airflow/ts-bundles.
+    # "ts-native" has no root, so it serves the Dag bundle: it parses the bundle's
+    # native Dag, in the Dag processor and on the worker that runs the Dag's
+    # Python task (trigger_downstream).
     coordinator_config = json.dumps(
         {
             "ts": {
@@ -738,7 +747,11 @@ def _setup_ts_sdk_integration(dot_env_file, tmp_dir):
                     "bundles_root": ["/opt/airflow/ts-bundles"],
                     "node_executable": "/opt/nodejs/node",
                 },
-            }
+            },
+            "ts-native": {
+                "classpath": "airflow.sdk.coordinators.node.NodeCoordinator",
+                "kwargs": {"node_executable": "/opt/nodejs/node"},
+            },
         }
     )
     queue_to_coordinator = json.dumps({"typescript": "ts"})
