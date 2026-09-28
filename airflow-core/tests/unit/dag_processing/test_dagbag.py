@@ -59,6 +59,7 @@ from unit import cluster_policies
 from unit.dag_processing.fake_importers import (
     ERROR_LISTING_JAR_IMPORTER,
     FAKE_IMPORTER,
+    MEMBER_ERROR_LISTING_JAR_IMPORTER,
     task_sdk_importers,
     write_jar,
 )
@@ -1582,14 +1583,40 @@ class TestClaimedFiles:
             in (dagbag.import_errors["claimed.fake"])
         )
 
-    def test_discovery_error_is_an_import_error(self, tmp_path):
+    @pytest.mark.parametrize(
+        ("importer_config", "error_key"),
+        [
+            pytest.param(ERROR_LISTING_JAR_IMPORTER, "library.jar", id="relative-to-the-file"),
+            pytest.param(MEMBER_ERROR_LISTING_JAR_IMPORTER, "library.jar/Main.java", id="archive-member"),
+        ],
+    )
+    def test_single_file_discovery_error_is_keyed_by_the_file(self, tmp_path, importer_config, error_key):
         library = write_jar(tmp_path / "library.jar")
 
-        with task_sdk_importers(ERROR_LISTING_JAR_IMPORTER):
+        with task_sdk_importers(importer_config):
             dagbag = DagBag(dag_folder=os.fspath(library), bundle_path=tmp_path, bundle_name="testing")
 
         assert dagbag.dags == {}
+        assert dagbag.import_errors == {error_key: "no dags.txt"}
+
+    def test_folder_discovery_error_is_an_import_error(self, tmp_path):
+        write_jar(tmp_path / "library.jar")
+
+        with task_sdk_importers(ERROR_LISTING_JAR_IMPORTER):
+            dagbag = DagBag(dag_folder=os.fspath(tmp_path), bundle_path=tmp_path, bundle_name="testing")
+
         assert dagbag.import_errors == {"library.jar": "no dags.txt"}
+
+    def test_archive_member_importer_cannot_claim_files(self, tmp_path):
+        with zipfile.ZipFile(tmp_path / "packaged.jar", "w") as jar:
+            jar.writestr("zipped_dag.py", PY_DAG_SOURCE.format(dag_id="zipped_dag"))
+
+        with task_sdk_importers({"classpath": "airflow.sdk.importers.ZipImporter", "extensions": [".jar"]}):
+            dagbag = DagBag(dag_folder=os.fspath(tmp_path), bundle_path=tmp_path, bundle_name="testing")
+
+        assert dagbag.dags == {}
+        assert list(dagbag.import_errors) == ["packaged.jar"]
+        assert "ZipImporter cannot claim .jar files" in dagbag.import_errors["packaged.jar"]
 
     def test_built_in_importer_claims_a_configured_extension(self, tmp_path):
         claimed = tmp_path / "python_dag.dagpy"

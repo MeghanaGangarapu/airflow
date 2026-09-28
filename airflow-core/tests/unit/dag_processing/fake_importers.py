@@ -21,12 +21,14 @@ from __future__ import annotations
 
 import contextlib
 import json
+import os
 import zipfile
 from typing import TYPE_CHECKING, Any
 
 from airflow.sdk import DAG, BaseOperator
 from airflow.sdk.importers import (
     AbstractDagImporter,
+    DagDefinition,
     DagImportError,
     DagImportResult,
     DagImportWarning,
@@ -48,6 +50,8 @@ JAR_IMPORTER = f"{__name__}.JarDagImporter"
 FAILING_SOURCE_JAR_IMPORTER = f"{__name__}.FailingSourceJarImporter"
 ERROR_LISTING_JAR_IMPORTER = f"{__name__}.ErrorListingJarImporter"
 RAISING_LISTING_JAR_IMPORTER = f"{__name__}.RaisingListingJarImporter"
+MEMBER_ERROR_LISTING_JAR_IMPORTER = f"{__name__}.MemberErrorListingJarImporter"
+NON_FILE_LISTING_JAR_IMPORTER = f"{__name__}.NonFileListingJarImporter"
 
 
 def build_dag(dag_id: str, definition: FilesystemDagDefinition, bundle: Any) -> DAG:
@@ -124,7 +128,13 @@ class FailingSourceJarImporter(JarDagImporter):
 
 
 class ErrorListingJarImporter(JarDagImporter):
-    """Report a JAR without ``dags.txt`` as a discovery error instead of skipping it."""
+    """
+    Report a JAR without ``dags.txt`` as a discovery error instead of skipping it.
+
+    The error names the JAR relative to the listed root, as the Task SDK ``ZipImporter`` does.
+    """
+
+    member = ""
 
     def list_dag_definitions(self, bundle, *, safe_mode=True) -> Iterator[Any]:
         for definition in find_file_dag_definitions(bundle.path, self.supported_extensions):
@@ -132,7 +142,38 @@ class ErrorListingJarImporter(JarDagImporter):
                 if "dags.txt" in jar.namelist():
                     yield definition
                 else:
-                    yield DagImportError(source_reference=repr(definition), message="no dags.txt")
+                    reference = os.path.join(definition.get_relative_loc(bundle.path), self.member)
+                    yield DagImportError(source_reference=os.path.normpath(reference), message="no dags.txt")
+
+
+class MemberErrorListingJarImporter(ErrorListingJarImporter):
+    """Report the discovery error against a member of the JAR, such as ``library.jar/Main.java``."""
+
+    member = "Main.java"
+
+
+class NonFileListingJarImporter(JarDagImporter):
+    """List a definition that is not a file next to the JARs."""
+
+    def list_dag_definitions(self, bundle, *, safe_mode=True) -> Iterator[Any]:
+        yield NotAFileDagDefinition()
+        yield from super().list_dag_definitions(bundle, safe_mode=safe_mode)
+
+
+class NotAFileDagDefinition(DagDefinition):
+    freshness_token = ""
+
+    def get_relative_loc(self, root=None) -> str:
+        return "not-a-file"
+
+    def read_bytes(self) -> bytes:
+        return b""
+
+    def as_file(self):
+        raise NotImplementedError
+
+    def __repr__(self) -> str:
+        return "not-a-file"
 
 
 class RaisingListingJarImporter(JarDagImporter):
