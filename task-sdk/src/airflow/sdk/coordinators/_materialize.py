@@ -210,7 +210,7 @@ def _import_operator_class(var: dict[str, Any]) -> type[BaseOperator]:
     return operator_class
 
 
-def _build_task(var: dict[str, Any], dag: DAG, group: TaskGroup) -> BaseOperator:
+def _build_task(var: dict[str, Any], dag: DAG, group: TaskGroup, *, import_operators: bool) -> BaseOperator:
     if var.get("_is_mapped"):
         raise ValueError("mapped tasks are not supported")
     kwargs = {
@@ -220,7 +220,9 @@ def _build_task(var: dict[str, Any], dag: DAG, group: TaskGroup) -> BaseOperator
         **_decode_operator_kwargs(var),
     }
     task: BaseOperator
-    if var.get("language") or var.get("is_stub"):
+    if not import_operators:
+        task = BaseOperator(**kwargs)
+    elif var.get("language") or var.get("is_stub"):
         task = import_string(_STUB_OPERATOR)(python_callable=_native_task, **kwargs)
         if "_arg_bindings" in var:
             task._arg_bindings = var["_arg_bindings"]
@@ -232,14 +234,17 @@ def _build_task(var: dict[str, Any], dag: DAG, group: TaskGroup) -> BaseOperator
     return task
 
 
-def materialize_dag(data: dict[str, Any]) -> DAG:
+def materialize_dag(data: dict[str, Any], *, import_operators: bool = True) -> DAG:
     """
     Build the ``airflow.sdk.DAG`` that a Lang-SDK runtime serialized into ``data``.
 
     A task the runtime executes becomes a ``@task.stub`` operator. A task that names a Python
     operator becomes that operator, so a Python worker can run it.
 
-    :raises ValueError: if the Dag uses a feature that cannot be rebuilt yet.
+    :param import_operators: Whether to import the operator classes. Without them, every task is
+        a plain ``BaseOperator``, which checks the Dag's structure and its tasks' common arguments
+        without importing any module the payload names.
+    :raises ValueError: if the Dag uses a feature that cannot be rebuilt yet, or cannot be built.
     """
     encoded = data["dag"]
     dag_id = encoded["dag_id"]
@@ -268,9 +273,12 @@ def materialize_dag(data: dict[str, Any]) -> DAG:
     for task_data in encoded["tasks"]:
         var = task_data["__var"]
         try:
-            tasks[var["task_id"]] = _build_task(var, dag, groups.get(var["task_id"], dag.task_group))
-        except ValueError as e:
-            raise ValueError(f"Dag {dag_id!r}, task {var['task_id']!r}: {e}") from None
+            tasks[var["task_id"]] = _build_task(
+                var, dag, groups.get(var["task_id"], dag.task_group), import_operators=import_operators
+            )
+        except Exception as e:
+            reason = e if isinstance(e, ValueError) else f"{type(e).__name__}: {e}"
+            raise ValueError(f"Dag {dag_id!r}, task {var['task_id']!r}: {reason}") from e
     for task_data in encoded["tasks"]:
         var = task_data["__var"]
         for downstream_task_id in var.get("downstream_task_ids", []):

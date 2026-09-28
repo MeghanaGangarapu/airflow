@@ -28,12 +28,13 @@ import datetime
 import json
 from pathlib import Path
 from unittest import mock
+from unittest.mock import patch
 
 import pytest
 
 from airflow.providers.standard.decorators.stub import _StubOperator
 from airflow.providers.standard.operators.trigger_dagrun import TriggerDagRunOperator
-from airflow.sdk import DAG
+from airflow.sdk import DAG, BaseOperator
 from airflow.sdk.coordinators._materialize import materialize_dag
 from airflow.sdk.exceptions import DagRunTriggerException
 from airflow.serialization.serialized_objects import DagSerialization
@@ -160,6 +161,15 @@ def test_keeps_the_dag_timezone(start_date):
     assert DagSerialization.to_dict(dag)["dag"]["timezone"] == "Asia/Tokyo"
 
 
+@patch("airflow.sdk.coordinators._materialize.import_string", autospec=True)
+def test_without_importing_operators_every_task_is_a_base_operator(mock_import_string):
+    dag = materialize_dag(_get_payload("native_rich"), import_operators=False)
+
+    assert {type(task) for task in dag.tasks} == {BaseOperator}
+    assert dag.task_dict["trigger_downstream"].retries == 1
+    mock_import_string.assert_not_called()
+
+
 def test_leaves_the_payload_unchanged():
     data = _get_payload("native_rich")
     original = copy.deepcopy(data)
@@ -193,6 +203,16 @@ def _set_task_key(data: dict, key: str, value: object) -> dict:
             lambda d: _set_task_key(d, "downstream_task_ids", ["missing"]),
             r"Dag 'conformance_minimal', task 'solo': the downstream task 'missing' does not exist",
             id="unknown-downstream-task",
+        ),
+        pytest.param(
+            lambda d: _set_task_key(d, "pool_slots", 0),
+            r"Dag 'conformance_minimal', task 'solo': pool slots for solo .* cannot be less than 1",
+            id="task-argument",
+        ),
+        pytest.param(
+            lambda d: _set_task_key(d["dag"].update(fail_fast=True) or d, "trigger_rule", "all_done"),
+            r"Dag 'conformance_minimal', task 'solo': FailFastDagInvalidTriggerRule: ",
+            id="not-a-value-error",
         ),
         pytest.param(
             lambda d: _set_task_key(d, "_is_mapped", True),

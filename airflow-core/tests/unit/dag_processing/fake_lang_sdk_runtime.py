@@ -28,6 +28,7 @@ do, and never imports Airflow. The ``.native`` file is JSON; its keys choose wha
 * ``sleep``: seconds to wait after the request arrives.
 * ``invalid``: return Dags that do not deserialize.
 * ``cyclic``: return Dags whose task depends on itself.
+* ``task_args``: keys to set on each Dag's task.
 * ``import_errors``: import errors to return, keyed as the runtime keys them.
 * ``pid_file``: a file to write the runtime's pid to.
 * ``raw_frames``: hex-encoded bytes to send on comm before replying.
@@ -81,7 +82,14 @@ def _receive_frame(sock: socket.socket) -> list:
 
 
 def _build_payload(
-    dag_id: str, *, fileloc: str, bundle_path: str, description: str, invalid: bool, cyclic: bool
+    dag_id: str,
+    *,
+    fileloc: str,
+    bundle_path: str,
+    description: str,
+    invalid: bool,
+    cyclic: bool,
+    task_args: dict,
 ) -> dict:
     timetable = "no.such.Timetable" if invalid else "airflow.timetables.simple.NullTimetable"
     return {
@@ -104,6 +112,7 @@ def _build_payload(
                         "template_fields": [],
                         "is_stub": True,
                         **({"downstream_task_ids": ["extract"]} if cyclic else {}),
+                        **task_args,
                     },
                 }
             ],
@@ -174,6 +183,7 @@ def main() -> None:
         "description": description,
         "invalid": spec.get("invalid", False),
         "cyclic": spec.get("cyclic", False),
+        "task_args": spec.get("task_args", {}),
     }
     result = {
         "type": "DagFileParsingResult",

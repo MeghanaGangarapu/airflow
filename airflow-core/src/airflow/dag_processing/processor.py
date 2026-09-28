@@ -49,6 +49,7 @@ from airflow.configuration import conf
 from airflow.dag_processing.bundles.base import BundleVersionLock
 from airflow.dag_processing.dagbag import BundleDagBag, DagBag
 from airflow.models.dag import DagModel
+from airflow.sdk.coordinators._materialize import materialize_dag
 from airflow.sdk.coordinators._subprocess import _is_connection_from_pid, _ResourceTracker, _start_server
 from airflow.sdk.exceptions import AirflowRuntimeError, TaskNotFound
 from airflow.sdk.execution_time import supervisor, task_runner
@@ -1177,6 +1178,9 @@ class LangSDKDagFileProcessorProcess(DagFileProcessorProcess):
                 DagSerialization.validate_schema(dag.data)
                 DagSerialization.from_dict(copy.deepcopy(dag.data))
                 _check_task_graph_is_acyclic(dag.data)
+                # A Dag bag rebuilds the Dag as SDK objects, which check more than the serialized
+                # form does. The operators are not imported, so no module the payload names runs here.
+                materialize_dag(copy.deepcopy(dag.data), import_operators=False)
             except Exception as e:
                 message = (
                     f"Cannot load the serialized Dag {_get_dag_id(dag.data)!r}: "

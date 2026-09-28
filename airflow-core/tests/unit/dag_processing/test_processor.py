@@ -2796,6 +2796,31 @@ class TestLangSDKDagFileProcessorProcess:
             "message": "A parse result was already received"
         }
 
+    def test_a_dag_a_dag_bag_cannot_rebuild_is_an_import_error(self, start, selector):
+        proc = start(dags=["native_dag"], task_args={"pool_slots": 0})
+
+        _service_until_ready(proc, selector)
+
+        assert proc.parsing_result.serialized_dags == []
+        [message] = proc.parsing_result.import_errors.values()
+        assert message.startswith(
+            "Cannot load the serialized Dag 'native_dag': ValueError: Dag 'native_dag', task 'extract': pool slots"
+        )
+
+    def test_a_python_operator_is_not_imported_to_check_a_dag(self, start, selector):
+        task_args = {
+            "language": None,
+            "is_stub": None,
+            "_task_module": "no_such_module",
+            "task_type": "Operator",
+        }
+        proc = start(dags=["native_dag"], task_args=task_args)
+
+        _service_until_ready(proc, selector)
+
+        assert proc.parsing_result.import_errors is None
+        assert [dag.dag_id for dag in proc.parsing_result.serialized_dags] == ["native_dag"]
+
     def test_runtime_import_errors_are_kept(self, start, selector):
         proc = start(dags=[], import_errors={"dag.native": "native Dag failed"})
 
