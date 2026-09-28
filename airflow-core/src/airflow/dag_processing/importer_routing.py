@@ -38,6 +38,7 @@ from airflow.sdk.importers import (
     DagImportResult,
     FilesystemDagDefinition,
     ZipMemberDagDefinition,
+    find_file_dag_definitions,
     get_file_suffix,
     get_importer_registry,
 )
@@ -126,14 +127,20 @@ def _claimed_importer_or_none(
         return None
 
 
-def _claiming_importers(registry: DagImporterRegistry) -> list[AbstractDagImporter[Any]]:
-    importers: list[AbstractDagImporter[Any]] = []
+def _group_claiming_importers(
+    registry: DagImporterRegistry,
+) -> list[tuple[AbstractDagImporter[Any] | None, list[str]]]:
+    """Pair each claiming importer with its extensions; an importer that cannot load is ``None``."""
+    groups: list[tuple[AbstractDagImporter[Any] | None, list[str]]] = []
     for ext in _get_claimed_extensions(registry):
         # Any file name works: the registry routes by its suffix.
         importer = _claimed_importer_or_none(registry, f"_{ext}")
-        if importer is not None and importer not in importers:
-            importers.append(importer)
-    return importers
+        group = next((g for g in groups if importer is not None and g[0] is importer), None)
+        if group is None:
+            groups.append((importer, [ext]))
+        else:
+            group[1].append(ext)
+    return groups
 
 
 def has_claiming_importers(registry: DagImporterRegistry) -> bool:
@@ -141,40 +148,55 @@ def has_claiming_importers(registry: DagImporterRegistry) -> bool:
     return bool(_get_claimed_extensions(registry))
 
 
-def iter_claimed_paths(
+def _get_listed_path(
+    registry: DagImporterRegistry, importer: AbstractDagImporter[Any], item: object
+) -> Path | None:
+    """Return the file to parse for a listed item, or ``None`` when ``importer`` does not own one."""
+    if isinstance(item, DagImportError):
+        log.warning("Dag discovery error: %s", item.format_message())
+        # Parsing the file lists it again and records the error as its import error.
+        path = Path(item.source_reference)
+        if not path.is_file():
+            return None
+    elif isinstance(item, ZipMemberDagDefinition):
+        path = item.zip_path
+    elif isinstance(item, FilesystemDagDefinition):
+        path = item.path
+    else:
+        log.warning("Skipping %r: %s did not list a file", item, type(importer).__name__)
+        return None
+    return path if _claimed_importer_or_none(registry, path) is importer else None
+
+
+def merge_claimed_paths(
     registry: DagImporterRegistry,
     bundle: BaseDagBundle | BundleRef,
+    legacy_paths: list[str],
     *,
     safe_mode: bool,
-) -> Iterator[Path]:
+) -> list[str]:
     """
-    Yield each file under ``bundle.path`` that a Task SDK importer claims, once, in walk order.
+    Replace the claimed files in ``legacy_paths`` with the files that claiming importers list.
 
-    An archive member is reported as its archive, which is the file that gets parsed. Discovery
-    errors are logged and skipped.
+    An archive member is reported as its archive, which is the file that gets parsed. A file named
+    by a discovery error is kept, so parsing it records the error. When an importer cannot load,
+    or raises while listing, every file with its extensions is kept: parsing each one then reports
+    the failure, instead of the files' Dags being treated as deleted.
     """
-    seen: set[Path] = set()
-    for importer in _claiming_importers(registry):
-        try:
-            items = list(importer.list_dag_definitions(_as_bundle(bundle), safe_mode=safe_mode))
-        except Exception:
-            log.exception("Cannot list the Dag files that %s claims", type(importer).__name__)
-            continue
-        for item in items:
-            if isinstance(item, DagImportError):
-                log.warning("Skipping a Dag definition: %s", item.format_message())
+    bundle_path = _as_bundle(bundle).path
+    claimed_paths: dict[str, None] = {}
+    for importer, extensions in _group_claiming_importers(registry):
+        if importer is not None:
+            try:
+                for item in importer.list_dag_definitions(_as_bundle(bundle), safe_mode=safe_mode):
+                    if (path := _get_listed_path(registry, importer, item)) is not None:
+                        claimed_paths.setdefault(os.fspath(path))
                 continue
-            if isinstance(item, ZipMemberDagDefinition):
-                path = item.zip_path
-            elif isinstance(item, FilesystemDagDefinition):
-                path = item.path
-            else:
-                log.warning("Skipping %r: %s did not list a file", item, type(importer).__name__)
-                continue
-            if path in seen or _claimed_importer_or_none(registry, path) is not importer:
-                continue
-            seen.add(path)
-            yield path
+            except Exception:
+                log.exception("Cannot list the Dag files that %s claims", type(importer).__name__)
+        for definition in find_file_dag_definitions(bundle_path, extensions):
+            claimed_paths.setdefault(os.fspath(definition.path))
+    return [path for path in legacy_paths if not is_claimed(registry, path)] + list(claimed_paths)
 
 
 def _failed_result(source_reference: str, error: Exception) -> DagImportResult:

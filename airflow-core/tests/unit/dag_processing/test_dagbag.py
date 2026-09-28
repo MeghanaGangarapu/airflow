@@ -56,7 +56,12 @@ from tests_common.pytest_plugin import AIRFLOW_ROOT_PATH
 from tests_common.test_utils import db
 from tests_common.test_utils.config import conf_vars
 from unit import cluster_policies
-from unit.dag_processing.fake_importers import FAKE_IMPORTER, task_sdk_importers
+from unit.dag_processing.fake_importers import (
+    ERROR_LISTING_JAR_IMPORTER,
+    FAKE_IMPORTER,
+    task_sdk_importers,
+    write_jar,
+)
 from unit.models import TEST_DAGS_FOLDER
 
 pytestmark = pytest.mark.db_test
@@ -1576,6 +1581,15 @@ class TestClaimedFiles:
             "Failed to load DAG importer 'unit.dag_processing.missing.Importer'"
             in (dagbag.import_errors["claimed.fake"])
         )
+
+    def test_discovery_error_is_an_import_error(self, tmp_path):
+        library = write_jar(tmp_path / "library.jar")
+
+        with task_sdk_importers(ERROR_LISTING_JAR_IMPORTER):
+            dagbag = DagBag(dag_folder=os.fspath(library), bundle_path=tmp_path, bundle_name="testing")
+
+        assert dagbag.dags == {}
+        assert dagbag.import_errors == {"library.jar": "no dags.txt"}
 
     def test_built_in_importer_claims_a_configured_extension(self, tmp_path):
         claimed = tmp_path / "python_dag.dagpy"

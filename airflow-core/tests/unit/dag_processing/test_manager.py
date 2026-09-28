@@ -89,7 +89,14 @@ from tests_common.test_utils.db import (
     clear_db_serialized_dags,
     clear_db_teams,
 )
-from unit.dag_processing.fake_importers import FAKE_IMPORTER, JAR_IMPORTER, task_sdk_importers, write_jar
+from unit.dag_processing.fake_importers import (
+    ERROR_LISTING_JAR_IMPORTER,
+    FAKE_IMPORTER,
+    JAR_IMPORTER,
+    RAISING_LISTING_JAR_IMPORTER,
+    task_sdk_importers,
+    write_jar,
+)
 from unit.models import TEST_DAGS_FOLDER
 
 pytestmark = pytest.mark.db_test
@@ -453,6 +460,30 @@ class TestDagFileProcessorManager:
             found = DagFileProcessorManager(max_runs=1)._find_files_in_bundle(bundle)
 
         assert sorted(found) == [Path("claimed.fake"), Path("native.jar"), Path("python_dag.py")]
+
+    @pytest.mark.parametrize(
+        "importer_config",
+        [
+            pytest.param(ERROR_LISTING_JAR_IMPORTER, id="discovery-error"),
+            pytest.param(RAISING_LISTING_JAR_IMPORTER, id="listing-raises"),
+            pytest.param(
+                {"classpath": "unit.dag_processing.missing.Importer", "extensions": [".jar"]},
+                id="importer-cannot-load",
+            ),
+        ],
+    )
+    def test_find_files_in_bundle_keeps_claimed_files_when_listing_fails(self, tmp_path, importer_config):
+        (tmp_path / "python_dag.py").write_text("from airflow.sdk import DAG\n")
+        write_jar(tmp_path / "native.jar", "native_dag")
+        write_jar(tmp_path / "library.jar")
+        bundle = MagicMock(spec=BaseDagBundle)
+        bundle.name = "testing"
+        bundle.path = tmp_path
+
+        with task_sdk_importers(importer_config):
+            found = DagFileProcessorManager(max_runs=1)._find_files_in_bundle(bundle)
+
+        assert sorted(found) == [Path("library.jar"), Path("native.jar"), Path("python_dag.py")]
 
     def test_get_observed_filelocs_keeps_a_claimed_archive_whole(self, tmp_path):
         write_jar(tmp_path / "native.jar", "native_dag")

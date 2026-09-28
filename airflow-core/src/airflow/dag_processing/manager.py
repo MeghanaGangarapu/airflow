@@ -59,7 +59,7 @@ from airflow.dag_processing.importer_routing import (
     get_task_sdk_registry,
     has_claiming_importers,
     is_claimed,
-    iter_claimed_paths,
+    merge_claimed_paths,
 )
 from airflow.dag_processing.processor import DagFileParsingResult, DagFileProcessorProcess
 from airflow.models.asset import remove_references_to_deleted_dags
@@ -983,11 +983,8 @@ class DagFileProcessorManager(LoggingMixin):
         file_paths = list_py_file_paths(bundle.path, safe_mode=self.dag_discovery_safe_mode)
         registry = get_task_sdk_registry(bundle.name)
         if registry is not None and has_claiming_importers(registry):
-            # A claimed archive, such as a JAR, is one Dag file rather than a zip of Python files.
-            file_paths = [path for path in file_paths if not is_claimed(registry, path)]
-            file_paths.extend(
-                os.fspath(path)
-                for path in iter_claimed_paths(registry, bundle, safe_mode=self.dag_discovery_safe_mode)
+            file_paths = merge_claimed_paths(
+                registry, bundle, file_paths, safe_mode=self.dag_discovery_safe_mode
             )
         rel_paths = [Path(x).relative_to(bundle.path) for x in file_paths]
         self.log.info(

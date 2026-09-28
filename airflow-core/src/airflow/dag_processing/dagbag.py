@@ -38,8 +38,8 @@ from airflow.dag_processing.importer_routing import (
     get_task_sdk_registry,
     has_claiming_importers,
     is_claimed,
-    iter_claimed_paths,
     iter_claimed_results,
+    merge_claimed_paths,
 )
 from airflow.dag_processing.importers import get_importer_registry
 from airflow.exceptions import (
@@ -617,12 +617,12 @@ class DagBag(LoggingMixin):
             return [os.fspath(dag_folder)] if is_claimed(task_sdk_registry, dag_folder) else legacy_files
         if not has_claiming_importers(task_sdk_registry):
             return legacy_files
-        claimed_paths = iter_claimed_paths(
-            task_sdk_registry, BundleRef(name=self.bundle_name, path=Path(dag_folder)), safe_mode=safe_mode
+        return merge_claimed_paths(
+            task_sdk_registry,
+            BundleRef(name=self.bundle_name, path=Path(dag_folder)),
+            legacy_files,
+            safe_mode=safe_mode,
         )
-        return [path for path in legacy_files if not is_claimed(task_sdk_registry, path)] + [
-            str(path) for path in claimed_paths
-        ]
 
     def dagbag_report(self):
         """Print a report around DagBag loading stats."""

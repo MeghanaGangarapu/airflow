@@ -46,6 +46,8 @@ if TYPE_CHECKING:
 FAKE_IMPORTER = f"{__name__}.FakeDagImporter"
 JAR_IMPORTER = f"{__name__}.JarDagImporter"
 FAILING_SOURCE_JAR_IMPORTER = f"{__name__}.FailingSourceJarImporter"
+ERROR_LISTING_JAR_IMPORTER = f"{__name__}.ErrorListingJarImporter"
+RAISING_LISTING_JAR_IMPORTER = f"{__name__}.RaisingListingJarImporter"
 
 
 def build_dag(dag_id: str, definition: FilesystemDagDefinition, bundle: Any) -> DAG:
@@ -119,6 +121,26 @@ class JarDagImporter(AbstractDagImporter[FilesystemDagDefinition]):
 class FailingSourceJarImporter(JarDagImporter):
     def get_source_code(self, definition) -> DagSourceCode:
         raise RuntimeError("cannot read the embedded source")
+
+
+class ErrorListingJarImporter(JarDagImporter):
+    """Report a JAR without ``dags.txt`` as a discovery error instead of skipping it."""
+
+    def list_dag_definitions(self, bundle, *, safe_mode=True) -> Iterator[Any]:
+        for definition in find_file_dag_definitions(bundle.path, self.supported_extensions):
+            with zipfile.ZipFile(definition.path) as jar:
+                if "dags.txt" in jar.namelist():
+                    yield definition
+                else:
+                    yield DagImportError(source_reference=repr(definition), message="no dags.txt")
+
+
+class RaisingListingJarImporter(JarDagImporter):
+    """List the readable JARs, then fail as if the next one were corrupt."""
+
+    def list_dag_definitions(self, bundle, *, safe_mode=True) -> Iterator[FilesystemDagDefinition]:
+        yield from super().list_dag_definitions(bundle, safe_mode=safe_mode)
+        raise zipfile.BadZipFile("corrupt archive")
 
 
 def write_jar(path: Path, *dag_ids: str, source: str = "class Main {}\n") -> Path:
