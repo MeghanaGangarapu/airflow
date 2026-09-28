@@ -274,5 +274,10 @@ def materialize_dag(data: dict[str, Any]) -> DAG:
     for task_data in encoded["tasks"]:
         var = task_data["__var"]
         for downstream_task_id in var.get("downstream_task_ids", []):
+            if downstream_task_id not in tasks:
+                raise ValueError(
+                    f"Dag {dag_id!r}, task {var['task_id']!r}: the downstream task "
+                    f"{downstream_task_id!r} does not exist"
+                )
             tasks[var["task_id"]].set_downstream(tasks[downstream_task_id])
     return dag

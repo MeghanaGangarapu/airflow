@@ -190,6 +190,11 @@ def _set_task_key(data: dict, key: str, value: object) -> dict:
             id="timetable",
         ),
         pytest.param(
+            lambda d: _set_task_key(d, "downstream_task_ids", ["missing"]),
+            r"Dag 'conformance_minimal', task 'solo': the downstream task 'missing' does not exist",
+            id="unknown-downstream-task",
+        ),
+        pytest.param(
             lambda d: _set_task_key(d, "_is_mapped", True),
             r"Dag 'conformance_minimal', task 'solo': mapped tasks are not supported",
             id="mapped-task",
