@@ -63,6 +63,7 @@ from airflow.dag_processing.processor import (
     LangSDKDagFileProcessorProcess,
     ToDagProcessor,
     ToManager,
+    _check_task_graph_is_acyclic,
     _execute_callbacks,
     _execute_dag_callbacks,
     _execute_email_callbacks,
@@ -2734,6 +2735,17 @@ class TestLangSDKDagFileProcessorProcess:
         [message] = proc.parsing_result.import_errors.values()
         assert message.startswith("Cannot load the serialized Dag 'broken_dag': ")
 
+    def test_a_dag_with_a_cycle_is_an_import_error(self, start, selector):
+        proc = start(dags=["cyclic_dag"], cyclic=True)
+
+        _service_until_ready(proc, selector)
+
+        assert proc.parsing_result.serialized_dags == []
+        assert proc.parsing_result.import_errors == {
+            "dag.native": "Cannot load the serialized Dag 'cyclic_dag': "
+            "ValueError: Cycle detected in Dag 'cyclic_dag'. Faulty task: 'extract'"
+        }
+
     def test_runtime_import_errors_are_kept(self, start, selector):
         proc = start(dags=[], import_errors={"dag.native": "native Dag failed"})
 
@@ -2911,3 +2923,28 @@ class TestLangSDKDagFileProcessorProcessRun:
         [proc] = [c.args[0] for c in mock_close.call_args_list]
         assert proc._exit_code == -signal.SIGKILL
         assert not proc._open_sockets
+
+
+def _build_graph_payload(edges: dict[str, list[str]]) -> dict:
+    return {
+        "dag": {
+            "dag_id": "graph",
+            "tasks": [{"__var": {"task_id": t, "downstream_task_ids": d}} for t, d in edges.items()],
+        }
+    }
+
+
+def test_check_task_graph_rejects_a_cycle():
+    with pytest.raises(ValueError, match="Cycle detected in Dag 'graph'. Faulty task: 'a'"):
+        _check_task_graph_is_acyclic(_build_graph_payload({"a": ["b"], "b": ["c"], "c": ["a"]}))
+
+
+@pytest.mark.parametrize(
+    "edges",
+    [
+        pytest.param({"a": ["b", "c"], "b": ["d"], "c": ["d"], "d": []}, id="diamond"),
+        pytest.param({"a": [], "b": ["a"]}, id="reverse-declared"),
+    ],
+)
+def test_check_task_graph_accepts_an_acyclic_graph(edges):
+    _check_task_graph_is_acyclic(_build_graph_payload(edges))

@@ -781,6 +781,36 @@ def _exec_lang_sdk_runtime(
     os._exit(127)
 
 
+def _check_task_graph_is_acyclic(data: dict[str, Any]) -> None:
+    """
+    Raise ``ValueError`` when the serialized Dag's task graph has a cycle.
+
+    A Python Dag is checked by ``DAG.check_cycle`` before it is serialized; a Lang-SDK runtime's
+    Dag is only seen serialized, so it is checked here.
+    """
+    downstream = {
+        task["__var"]["task_id"]: task["__var"].get("downstream_task_ids", [])
+        for task in data["dag"]["tasks"]
+    }
+    done: set[str] = set()
+    for root in downstream:
+        if root in done:
+            continue
+        in_progress = {root}
+        stack = [(root, iter(downstream[root]))]
+        while stack:
+            task_id, children = stack[-1]
+            if (child := next(children, None)) is None:
+                stack.pop()
+                in_progress.discard(task_id)
+                done.add(task_id)
+            elif child in in_progress:
+                raise ValueError(f"Cycle detected in Dag {data['dag']['dag_id']!r}. Faulty task: {child!r}")
+            elif child not in done and child in downstream:
+                in_progress.add(child)
+                stack.append((child, iter(downstream[child])))
+
+
 def _get_dag_id(data: Any) -> str | None:
     try:
         return data["dag"]["dag_id"]
@@ -1123,6 +1153,7 @@ class LangSDKDagFileProcessorProcess(DagFileProcessorProcess):
             try:
                 DagSerialization.validate_schema(dag.data)
                 DagSerialization.from_dict(copy.deepcopy(dag.data))
+                _check_task_graph_is_acyclic(dag.data)
             except Exception as e:
                 message = (
                     f"Cannot load the serialized Dag {_get_dag_id(dag.data)!r}: "
