@@ -24,10 +24,13 @@ from typing import TYPE_CHECKING, Any
 
 from airflow.sdk import DAG, BaseOperator, TaskGroup
 from airflow.sdk._shared.module_loading import import_string
+from airflow.sdk._shared.timezones.timezone import parse_timezone
 from airflow.sdk.definitions.timetables.simple import ContinuousTimetable, NullTimetable, OnceTimetable
 from airflow.sdk.definitions.timetables.trigger import CronTriggerTimetable
 
 if TYPE_CHECKING:
+    from pendulum.tz.timezone import FixedTimezone, Timezone
+
     from airflow.sdk.bases.timetable import BaseTimetable
 
 _STUB_OPERATOR = "airflow.providers.standard.decorators.stub._StubOperator"
@@ -115,8 +118,10 @@ _DERIVED_TASK_KEYS = frozenset(
 def _native_task(): ...
 
 
-def _decode_datetime(value: float) -> datetime.datetime:
-    return datetime.datetime.fromtimestamp(value, tz=datetime.timezone.utc)
+def _decode_datetime(
+    value: float, tz: datetime.tzinfo | FixedTimezone | Timezone = datetime.timezone.utc
+) -> datetime.datetime:
+    return datetime.datetime.fromtimestamp(value, tz=tz)
 
 
 def _decode_timedelta(value: float) -> datetime.timedelta:
@@ -242,9 +247,10 @@ def materialize_dag(data: dict[str, Any]) -> DAG:
         if encoded.get(key):
             raise ValueError(f"Dag {dag_id!r} sets {key!r}, which a Lang-SDK Dag cannot use yet")
     kwargs: dict[str, Any] = {key: encoded[key] for key in _DAG_KEYS & encoded.keys()}
+    tz = parse_timezone(encoded.get("timezone", "UTC"))
     for key in ("start_date", "end_date"):
         if encoded.get(key) is not None:
-            kwargs[key] = _decode_datetime(encoded[key])
+            kwargs[key] = _decode_datetime(encoded[key], tz)
     if encoded.get("dagrun_timeout") is not None:
         kwargs["dagrun_timeout"] = _decode_timedelta(encoded["dagrun_timeout"])
     try:
@@ -253,6 +259,8 @@ def materialize_dag(data: dict[str, Any]) -> DAG:
         raise ValueError(f"Dag {dag_id!r}: {e}") from None
 
     dag = DAG(dag_id, schedule=timetable, **kwargs)
+    # A Dag without a start date would otherwise take the deployment's default timezone.
+    dag.timezone = tz
     dag.fileloc = encoded["fileloc"]
     dag.relative_fileloc = encoded.get("relative_fileloc")
     groups = _build_task_groups(dag, encoded["task_group"])

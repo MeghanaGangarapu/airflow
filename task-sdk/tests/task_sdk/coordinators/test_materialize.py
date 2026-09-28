@@ -149,6 +149,17 @@ def test_dag_attributes_are_rebuilt():
     assert (dag.catchup, dag.max_active_runs, dag.tags) == (True, 3, {"a", "b"})
 
 
+@pytest.mark.parametrize("start_date", [1767225600, None], ids=["start-date", "no-start-date"])
+def test_keeps_the_dag_timezone(start_date):
+    data = copy.deepcopy(_get_payload("conformance_minimal"))
+    data["dag"].update(timezone="Asia/Tokyo", start_date=start_date)
+
+    dag = materialize_dag(data)
+
+    assert dag.timezone.name == "Asia/Tokyo"
+    assert DagSerialization.to_dict(dag)["dag"]["timezone"] == "Asia/Tokyo"
+
+
 def test_leaves_the_payload_unchanged():
     data = _get_payload("native_rich")
     original = copy.deepcopy(data)
