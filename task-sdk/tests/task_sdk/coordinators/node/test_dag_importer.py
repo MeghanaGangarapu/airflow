@@ -24,8 +24,7 @@ import pytest
 from task_sdk.coordinators.node._bundle_test_utils import (
     BUNDLE_NAME,
     LAYOUT_PREFIX,
-    mutate_byte,
-    read_layout,
+    mutate_section,
     write_bundle,
 )
 
@@ -45,14 +44,10 @@ def importer() -> NodeDagImporter:
     return NodeDagImporter(coordinator=NodeCoordinator())
 
 
-def _mutate_section(bundle: pathlib.Path, section: str) -> None:
-    mutate_byte(bundle, int(read_layout(bundle)[section]["start"], 16))  # type: ignore[index, call-overload]
-
-
 def test_lists_only_packed_bundles(importer, tmp_path):
     nested = write_bundle(tmp_path / "team", "sales")
     tampered = write_bundle(tmp_path, "inventory", name="tampered.min.mjs")
-    _mutate_section(tampered, "code")
+    mutate_section(tampered, "code")
     write_bundle(tmp_path, "orders", name="plain.mjs")
     (tmp_path / "vendor.min.mjs").write_bytes(b"export {};\n")
 
@@ -105,7 +100,7 @@ class TestGetSourceCode:
     @pytest.mark.parametrize(
         ("break_bundle", "reason"),
         [
-            (lambda path: _mutate_section(path, "source"), "source SHA-256 mismatch"),
+            (lambda path: mutate_section(path, "source"), "source SHA-256 mismatch"),
             (lambda path: write_bundle(path.parent, "sales", source=b"x" * (1024 * 1024 + 1)), "exceeds"),
             (lambda path: path.unlink(), "cannot read bundle.min.mjs"),
         ],
