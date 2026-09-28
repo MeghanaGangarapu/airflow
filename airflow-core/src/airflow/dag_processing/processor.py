@@ -879,6 +879,9 @@ class LangSDKDagFileProcessorProcess(DagFileProcessorProcess):
                     stderr=stderr_w,
                     status=status_w,
                 )
+            # Mirrors the child's setpgid, so the group exists before any signal is sent to it.
+            with contextlib.suppress(OSError):
+                os.setpgid(pid, pid)
             for sock in tracker.untrack(*child_ends):
                 sock.close()
 
@@ -890,6 +893,7 @@ class LangSDKDagFileProcessorProcess(DagFileProcessorProcess):
                 selector=selector,
                 bundle_name=bundle_name,
                 dag_file_rel_path=dag_file_rel_path,
+                new_process_group=True,
                 **kwargs,
             )
             proc._register_runtime_sockets(
@@ -969,6 +973,7 @@ class LangSDKDagFileProcessorProcess(DagFileProcessorProcess):
         status: socket,
     ) -> NoReturn:
         try:
+            os.setpgid(0, 0)
             supervisor._reset_signals()
             signal.pthread_sigmask(signal.SIG_SETMASK, set())
             for sock in parent_ends:
@@ -1203,13 +1208,25 @@ class LangSDKDagFileProcessorProcess(DagFileProcessorProcess):
         self._unverified_connections = []
 
     def _signal_subprocess(self, sig: signal.Signals) -> None:
-        # The command may be a launcher that starts the runtime which connects back, so the
-        # runtime's whole process tree is signalled, descendants first.
-        with contextlib.suppress(psutil.Error):
-            for descendant in psutil.Process(self.pid).children(recursive=True):
-                with contextlib.suppress(psutil.Error):
-                    descendant.send_signal(sig)
-        super()._signal_subprocess(sig)
+        # The runtime leads its own process group, so a runtime that a launcher started is
+        # signalled too, even once the launcher has exited.
+        try:
+            os.killpg(self.pid, sig)
+        except (ProcessLookupError, PermissionError):
+            self._process.send_signal(sig)
+
+    def _check_subprocess_exit(
+        self, raise_on_timeout: bool = False, expect_signal: None | int = None
+    ) -> int | None:
+        exited_before = self._exit_code is not None
+        exit_code = super()._check_subprocess_exit(
+            raise_on_timeout=raise_on_timeout, expect_signal=expect_signal
+        )
+        if exit_code is not None and not exited_before:
+            # Whatever is left in the runtime's group is an orphan and may hold its sockets open.
+            with contextlib.suppress(ProcessLookupError, PermissionError):
+                os.killpg(self.pid, signal.SIGKILL)
+        return exit_code
 
     def _kill_runtime(self) -> None:
         """Kill the runtime and wait for it, without servicing its sockets, whose handler may have failed."""

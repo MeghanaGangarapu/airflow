@@ -2643,6 +2643,17 @@ def _service_once(selector) -> None:
             key.fileobj.close()
 
 
+def _assert_process_ends(pid: int, timeout: float = 10.0) -> None:
+    """Fail unless ``pid`` exits; a zombie counts, as no one may reap an orphan here."""
+    process = psutil.Process(pid)
+    deadline = time.monotonic() + timeout
+    while process.is_running() and process.status() != psutil.STATUS_ZOMBIE:
+        if time.monotonic() > deadline:
+            process.kill()
+            pytest.fail(f"process {pid} is still running")
+        time.sleep(0.1)
+
+
 def _service_until_ready(proc: LangSDKDagFileProcessorProcess, selector, timeout: float = 30.0) -> None:
     deadline = time.monotonic() + timeout
     while not proc.is_ready:
@@ -2827,6 +2838,21 @@ class TestLangSDKDagFileProcessorProcess:
         assert drained
         assert not [kind for kind in drained if kind.endswith("-listener")]
 
+    def test_a_runtime_whose_launcher_stops_is_killed(self, start, selector, tmp_path):
+        pid_file = tmp_path / "runtime.pid"
+        proc = start(
+            dags=["native_dag"], sleep=60, launcher=True, ignore_sigterm=True, pid_file=str(pid_file)
+        )
+        deadline = time.monotonic() + 30
+        while proc.stdin is None or proc._parse_request is not None:
+            assert time.monotonic() < deadline
+            _service_once(selector)
+
+        proc.kill(signal.SIGTERM, escalation_delay=5)
+
+        assert proc._exit_code == -signal.SIGTERM
+        _assert_process_ends(int(pid_file.read_text()))
+
     @patch("airflow.dag_processing.processor._is_connection_from_pid", autospec=True)
     def test_a_connection_is_used_only_once_verified(self, mock_owned, start, selector):
         mock_owned.return_value = False
@@ -2908,6 +2934,16 @@ class TestLangSDKDagFileProcessorProcessRun:
         assert proc._exit_code == -signal.SIGKILL
         assert not proc._open_sockets
 
+    def test_a_result_is_kept_when_the_runtime_leaves_a_process_behind(self, tmp_path):
+        grandchild_pid_file = tmp_path / "grandchild.pid"
+
+        result = self._run(
+            tmp_path, dags=["native_dag"], grandchild_holds=60, grandchild_pid_file=str(grandchild_pid_file)
+        )
+
+        assert [dag.dag_id for dag in result.serialized_dags] == ["native_dag"]
+        _assert_process_ends(int(grandchild_pid_file.read_text()))
+
     def test_a_timeout_kills_a_runtime_that_a_launcher_started(self, tmp_path):
         pid_file = tmp_path / "runtime.pid"
 
@@ -2916,13 +2952,7 @@ class TestLangSDKDagFileProcessorProcessRun:
                 tmp_path, dags=["native_dag"], sleep=30, launcher=True, pid_file=str(pid_file), timeout=2
             )
 
-        runtime = psutil.Process(int(pid_file.read_text()))
-        deadline = time.monotonic() + 10
-        while runtime.is_running() and runtime.status() != psutil.STATUS_ZOMBIE:
-            if time.monotonic() > deadline:
-                runtime.kill()
-                pytest.fail("the runtime outlived its launcher")
-            time.sleep(0.1)
+        _assert_process_ends(int(pid_file.read_text()))
 
     @patch.object(
         LangSDKDagFileProcessorProcess,

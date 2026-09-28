@@ -31,6 +31,9 @@ do, and never imports Airflow. The ``.native`` file is JSON; its keys choose wha
 * ``import_errors``: import errors to return, keyed as the runtime keys them.
 * ``pid_file``: a file to write the runtime's pid to.
 * ``raw_frames``: hex-encoded bytes to send on comm before replying.
+* ``ignore_sigterm``: ignore SIGTERM.
+* ``grandchild_holds``: after replying, exit and leave a grandchild holding the sockets for this many
+  seconds; its pid is written to ``grandchild_pid_file``.
 """
 
 from __future__ import annotations
@@ -38,6 +41,7 @@ from __future__ import annotations
 import datetime
 import json
 import os
+import signal
 import socket
 import sys
 import time
@@ -132,6 +136,8 @@ def main() -> None:
     spec = json.loads(Path(sys.argv[1]).read_text())
     if pid_file := spec.get("pid_file"):
         Path(pid_file).write_text(str(os.getpid()))
+    if spec.get("ignore_sigterm"):
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
     if (code := spec.get("exit_before_connect")) is not None:
         print("exiting before connecting", file=sys.stderr, flush=True)
         os._exit(code)
@@ -179,6 +185,13 @@ def main() -> None:
         "import_errors": spec.get("import_errors"),
     }
     _send_frame(comm, [request_id, result])
+    if seconds := spec.get("grandchild_holds"):
+        # A grandchild keeps comm, logs and stdout open after the runtime exits.
+        if (grandchild := os.fork()) == 0:
+            time.sleep(seconds)
+            os._exit(0)
+        Path(spec["grandchild_pid_file"]).write_text(str(grandchild))
+        os._exit(0)
     _receive_frame(comm)
     comm.close()
     logs.close()
