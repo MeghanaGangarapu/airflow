@@ -2785,6 +2785,18 @@ class TestLangSDKDagFileProcessorProcess:
         assert all(listener.fileno() == -1 for listener in listeners)
         assert not proc._open_sockets
 
+    @patch.object(LangSDKDagFileProcessorProcess, "cleanup_sockets_after_kill", autospec=True)
+    def test_close_closes_the_listeners_before_draining(self, mock_cleanup, start):
+        proc = start(dags=["native_dag"])
+        proc._process.send_signal(signal.SIGSTOP)
+        drained: list[str] = []
+        mock_cleanup.side_effect = lambda p: drained.extend(p._open_sockets.values())
+
+        proc.close()
+
+        assert drained
+        assert not [kind for kind in drained if kind.endswith("-listener")]
+
     @patch("airflow.dag_processing.processor._is_connection_from_pid", autospec=True)
     def test_a_connection_is_used_only_once_verified(self, mock_owned, start, selector):
         mock_owned.return_value = False
@@ -2853,12 +2865,32 @@ class TestLangSDKDagFileProcessorProcessRun:
         }
 
     @patch.object(
-        LangSDKDagFileProcessorProcess, "kill", autospec=True, side_effect=LangSDKDagFileProcessorProcess.kill
+        LangSDKDagFileProcessorProcess,
+        "close",
+        autospec=True,
+        side_effect=LangSDKDagFileProcessorProcess.close,
     )
-    def test_a_parse_past_its_timeout_is_killed(self, mock_kill, tmp_path):
+    def test_a_parse_past_its_timeout_is_killed(self, mock_close, tmp_path):
         with pytest.raises(TimeoutError, match="did not parse .*dag.native within 1s"):
             self._run(tmp_path, dags=["native_dag"], sleep=30, timeout=1)
 
-        [proc] = [c.args[0] for c in mock_kill.call_args_list]
-        mock_kill.assert_called_once_with(proc, signal.SIGKILL)
+        [proc] = [c.args[0] for c in mock_close.call_args_list]
         assert proc._exit_code == -signal.SIGKILL
+        assert not proc._open_sockets
+
+    @patch.object(
+        LangSDKDagFileProcessorProcess,
+        "close",
+        autospec=True,
+        side_effect=LangSDKDagFileProcessorProcess.close,
+    )
+    @patch.object(
+        LangSDKDagFileProcessorProcess, "_read_status", autospec=True, side_effect=RuntimeError("bad status")
+    )
+    def test_an_interrupted_parse_kills_the_runtime(self, mock_read_status, mock_close, tmp_path):
+        with pytest.raises(RuntimeError, match="bad status"):
+            self._run(tmp_path, dags=["native_dag"])
+
+        [proc] = [c.args[0] for c in mock_close.call_args_list]
+        assert proc._exit_code == -signal.SIGKILL
+        assert not proc._open_sockets

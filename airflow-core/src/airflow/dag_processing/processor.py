@@ -912,12 +912,14 @@ class LangSDKDagFileProcessorProcess(DagFileProcessorProcess):
                     wait = 0.1
                     if timeout is not None:
                         if (remaining := proc.start_time + timeout - time.monotonic()) <= 0:
-                            proc.kill(signal.SIGKILL)
                             raise TimeoutError(
                                 f"The Lang-SDK runtime did not parse {os.fspath(path)} within {timeout}s"
                             )
                         wait = min(wait, remaining)
                     proc._service_subprocess(max_wait_time=wait)
+            except BaseException:
+                proc._kill_runtime()
+                raise
             finally:
                 proc.close()
         return cast("DagFileParsingResult", proc.parsing_result)
@@ -1160,10 +1162,19 @@ class LangSDKDagFileProcessorProcess(DagFileProcessorProcess):
             conn.close()
         self._unverified_connections = []
 
+    def _kill_runtime(self) -> None:
+        """Kill the runtime and wait for it, without servicing its sockets, whose handler may have failed."""
+        if self._exit_code is not None:
+            return
+        try:
+            self._signal_subprocess(signal.SIGKILL)
+            self._exit_code = self._process.wait(timeout=None)
+        except (self._process.ProcessNotFound, ProcessLookupError):
+            self._exit_code = -1
+
     def close(self) -> None:
-        for conn, _, _ in self._unverified_connections:
-            conn.close()
-        self._unverified_connections = []
+        # A listener has nothing to drain, and cleanup would call its handler until the runtime exits.
+        self._close_unused_connections()
         if self.logger_filehandle is None:
             self.cleanup_sockets_after_kill()
         else:
