@@ -1,0 +1,220 @@
+{
+  "type": "DagFileParsingResult",
+  "fileloc": "/bundles/app/bundle.mjs",
+  "serialized_dags": [
+    {
+      "data": {
+        "__version": 3,
+        "dag": {
+          "dag_id": "native_rich",
+          "fileloc": "/bundles/app/bundle.mjs",
+          "relative_fileloc": "bundle.mjs",
+          "timezone": "UTC",
+          "timetable": {
+            "__type": "airflow.timetables.trigger.CronTriggerTimetable",
+            "__var": {
+              "expression": "0 6 * * *",
+              "timezone": "UTC",
+              "interval": 0,
+              "run_immediately": false
+            }
+          },
+          "tasks": [
+            {
+              "__type": "operator",
+              "__var": {
+                "task_id": "extract",
+                "task_type": "TypeScriptOperator",
+                "_task_module": "airflow.sdk.coordinators.node",
+                "language": "typescript",
+                "template_fields": [],
+                "is_stub": true,
+                "retries": 3,
+                "queue": "ts",
+                "execution_timeout": 120,
+                "retry_delay": 60,
+                "downstream_task_ids": [
+                  "gate",
+                  "load.load_a"
+                ]
+              }
+            },
+            {
+              "__type": "operator",
+              "__var": {
+                "task_id": "gate",
+                "task_type": "TypeScriptOperator",
+                "_task_module": "airflow.sdk.coordinators.node",
+                "language": "typescript",
+                "template_fields": [],
+                "is_stub": true,
+                "_arg_bindings": [
+                  {
+                    "name": "n",
+                    "kind": "xcom",
+                    "task_id": "extract"
+                  }
+                ],
+                "_can_skip_downstream": true,
+                "queue": "ts",
+                "downstream_task_ids": [
+                  "load.load_a",
+                  "report_empty"
+                ]
+              }
+            },
+            {
+              "__type": "operator",
+              "__var": {
+                "task_id": "load.load_a",
+                "task_type": "TypeScriptOperator",
+                "_task_module": "airflow.sdk.coordinators.node",
+                "language": "typescript",
+                "template_fields": [],
+                "is_stub": true,
+                "_arg_bindings": [
+                  {
+                    "name": "n",
+                    "kind": "xcom",
+                    "task_id": "extract"
+                  },
+                  {
+                    "name": "mode",
+                    "kind": "literal",
+                    "value": "full"
+                  }
+                ],
+                "trigger_rule": "none_failed",
+                "queue": "ts",
+                "downstream_task_ids": [
+                  "trigger_downstream"
+                ]
+              }
+            },
+            {
+              "__type": "operator",
+              "__var": {
+                "task_id": "report_empty",
+                "task_type": "TypeScriptOperator",
+                "_task_module": "airflow.sdk.coordinators.node",
+                "language": "typescript",
+                "template_fields": [],
+                "is_stub": true,
+                "queue": "ts"
+              }
+            },
+            {
+              "__type": "operator",
+              "__var": {
+                "task_id": "trigger_downstream",
+                "task_type": "TriggerDagRunOperator",
+                "_task_module": "airflow.providers.standard.operators.trigger_dagrun",
+                "template_fields": [
+                  "trigger_dag_id",
+                  "trigger_run_id",
+                  "logical_date",
+                  "conf",
+                  "wait_for_completion",
+                  "skip_when_already_exists"
+                ],
+                "ui_color": "#ffefeb",
+                "template_fields_renderers": {
+                  "conf": "py"
+                },
+                "_operator_extra_links": {
+                  "Triggered DAG": "_link_TriggerDagRunLink"
+                },
+                "trigger_dag_id": "downstream_etl",
+                "conf": {
+                  "source": "native_rich",
+                  "ds": "{{ ds }}"
+                },
+                "wait_for_completion": false,
+                "poke_interval": 30,
+                "reset_dag_run": true,
+                "note": "from ts",
+                "retries": 1
+              }
+            }
+          ],
+          "dag_dependencies": [
+            {
+              "source": "native_rich",
+              "target": "downstream_etl",
+              "label": "trigger_downstream",
+              "dependency_type": "trigger",
+              "dependency_id": "trigger_downstream"
+            }
+          ],
+          "task_group": {
+            "_group_id": null,
+            "group_display_name": "",
+            "prefix_group_id": true,
+            "tooltip": "",
+            "ui_color": "CornflowerBlue",
+            "ui_fgcolor": "#000",
+            "children": {
+              "extract": [
+                "operator",
+                "extract"
+              ],
+              "gate": [
+                "operator",
+                "gate"
+              ],
+              "report_empty": [
+                "operator",
+                "report_empty"
+              ],
+              "trigger_downstream": [
+                "operator",
+                "trigger_downstream"
+              ],
+              "load": [
+                "taskgroup",
+                {
+                  "_group_id": "load",
+                  "group_display_name": "",
+                  "prefix_group_id": true,
+                  "tooltip": "",
+                  "ui_color": "CornflowerBlue",
+                  "ui_fgcolor": "#000",
+                  "children": {
+                    "load.load_a": [
+                      "operator",
+                      "load.load_a"
+                    ]
+                  },
+                  "upstream_group_ids": [],
+                  "downstream_group_ids": [],
+                  "upstream_task_ids": [],
+                  "downstream_task_ids": []
+                }
+              ]
+            },
+            "upstream_group_ids": [],
+            "downstream_group_ids": [],
+            "upstream_task_ids": [],
+            "downstream_task_ids": []
+          },
+          "edge_info": {},
+          "params": [],
+          "deadline": null,
+          "allowed_run_types": null,
+          "description": "rich native dag",
+          "start_date": 1767225600,
+          "tags": [
+            "native",
+            "ts"
+          ],
+          "max_active_runs": 2,
+          "dagrun_timeout": 3600,
+          "catchup": false,
+          "max_active_tasks": 16,
+          "max_consecutive_failed_dag_runs": 0,
+          "disable_bundle_versioning": false
+        }
+      }
+    }
+  ]
+}
