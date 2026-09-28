@@ -17,6 +17,7 @@
 # under the License.
 from __future__ import annotations
 
+import os
 from unittest.mock import patch
 
 import pendulum
@@ -27,8 +28,8 @@ from sqlalchemy.exc import IntegrityError
 import airflow.example_dags as example_dags_module
 from airflow.dag_processing.dagbag import DagBag
 from airflow.models.dag_version import DagVersion
-from airflow.models.dagcode import DagCode
-from airflow.sdk import task as task_decorator
+from airflow.models.dagcode import SOURCE_UNAVAILABLE, DagCode
+from airflow.sdk import DAG, BaseOperator, task as task_decorator
 from airflow.serialization.definitions.dag import SerializedDAG
 
 # To move it to a shared module.
@@ -39,6 +40,12 @@ from airflow.utils.types import DagRunTriggeredByType, DagRunType
 
 from tests_common.test_utils.dag import sync_dag_to_db
 from tests_common.test_utils.db import clear_db_dag_code, clear_db_dags
+from unit.dag_processing.fake_importers import (
+    FAILING_SOURCE_JAR_IMPORTER,
+    JAR_IMPORTER,
+    task_sdk_importers,
+    write_jar,
+)
 
 pytestmark = pytest.mark.db_test
 
@@ -270,3 +277,71 @@ class TestDagCode:
         sync_dag_to_db(dag)
 
         assert DagCode.get_latest_dagcode(dag.dag_id).language == "python"
+
+
+class TestClaimedFileSource:
+    """A file that a Task SDK importer claims stores the source that its importer reads."""
+
+    def setup_method(self):
+        clear_db_dags()
+        clear_db_dag_code()
+
+    def teardown_method(self):
+        clear_db_dags()
+        clear_db_dag_code()
+
+    @staticmethod
+    def _native_dag(jar_path):
+        with DAG("native_dag", schedule=None) as dag:
+            BaseOperator(task_id="task")
+        dag.fileloc = os.fspath(jar_path)
+        dag.relative_fileloc = jar_path.name
+        return dag
+
+    def test_claimed_file_stores_the_importer_source(self, tmp_path, session):
+        jar = write_jar(tmp_path / "native.jar", "native_dag", source="class Main {}\n")
+
+        with task_sdk_importers(JAR_IMPORTER):
+            sync_dag_to_db(self._native_dag(jar), session=session)
+
+        assert DagCode.get_latest_dagcode("native_dag", session=session).source_code == "class Main {}\n"
+
+    def test_importer_failure_stores_a_placeholder(self, tmp_path, session):
+        jar = write_jar(tmp_path / "native.jar", "native_dag")
+
+        with task_sdk_importers(FAILING_SOURCE_JAR_IMPORTER):
+            sync_dag_to_db(self._native_dag(jar), session=session)
+
+        assert DagCode.get_latest_dagcode("native_dag", session=session).source_code == SOURCE_UNAVAILABLE
+
+    def test_update_source_code_reads_through_the_importer(self, tmp_path, session):
+        jar = write_jar(tmp_path / "native.jar", "native_dag", source="class Main {}\n")
+
+        with task_sdk_importers(JAR_IMPORTER):
+            sync_dag_to_db(self._native_dag(jar), session=session)
+            write_jar(jar, "native_dag", source="class Main { int v2; }\n")
+            DagCode.update_source_code("native_dag", os.fspath(jar), bundle_name="testing", session=session)
+
+        assert (
+            DagCode.get_latest_dagcode("native_dag", session=session).source_code
+            == "class Main { int v2; }\n"
+        )
+
+    def test_python_file_does_not_build_a_registry(self):
+        with (
+            patch("airflow.dag_processing.importer_routing.get_task_sdk_registry") as get_registry,
+            patch.object(DagCode, "get_code_from_file", return_value="# code") as read_file,
+        ):
+            assert DagCode._read_source("/bundle/dag.py", "testing") == "# code"
+
+        get_registry.assert_not_called()
+        read_file.assert_called_once_with("/bundle/dag.py")
+
+    def test_unclaimed_file_is_read_from_disk(self):
+        with (
+            task_sdk_importers(),
+            patch.object(DagCode, "get_code_from_file", return_value="notes") as read_file,
+        ):
+            assert DagCode._read_source("/bundle/notes.txt", "testing") == "notes"
+
+        read_file.assert_called_once_with("/bundle/notes.txt")

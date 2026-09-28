@@ -713,7 +713,9 @@ class SerializedDagModel(Base):
                 dag_version.bundle_version = bundle_version
                 dag_version.version_data = version_data
                 session.merge(dag_version)
-                DagCode.update_source_code(dag_id=dag.dag_id, fileloc=dag.fileloc, session=session)
+                DagCode.update_source_code(
+                    dag_id=dag.dag_id, fileloc=dag.fileloc, bundle_name=bundle_name, session=session
+                )
             if name_updated or bundle_metadata_changed:
                 # A write occurred — a deadline alert name update and/or a bundle
                 # metadata refresh — so report True so callers know the DB changed.
@@ -774,7 +776,9 @@ class SerializedDagModel(Base):
             dag_version.version_data = version_data
             session.merge(dag_version)
             # Update the latest DagCode
-            DagCode.update_source_code(dag_id=dag.dag_id, fileloc=dag.fileloc, session=session)
+            DagCode.update_source_code(
+                dag_id=dag.dag_id, fileloc=dag.fileloc, bundle_name=bundle_name, session=session
+            )
             stats.incr(
                 "dag.serialization.version_updated",
                 tags={"dag_id": dag.dag_id, "bundle_name": bundle_name},

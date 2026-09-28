@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime
+from pathlib import Path
 from typing import TYPE_CHECKING
 from uuid import UUID
 
@@ -44,6 +45,10 @@ if TYPE_CHECKING:
     from airflow.models.dag_version import DagVersion
 
 log = logging.getLogger(__name__)
+
+# Stored when a claimed file's importer cannot supply its source. Never empty, since an empty
+# source makes ``DagCode.__init__`` fall back to the source stored for the previous version.
+SOURCE_UNAVAILABLE = "Source code is not available for this Dag.\n"
 
 
 class DagCode(Base):
@@ -92,7 +97,7 @@ class DagCode(Base):
         :param session: ORM Session
         """
         log.debug("Writing DAG file %s into DagCode table", fileloc)
-        dag_code = DagCode(dag_version, fileloc, cls.get_code_from_file(fileloc))
+        dag_code = DagCode(dag_version, fileloc, cls._read_source(fileloc, dag_version.bundle_name))
         session.add(dag_code)
         log.debug("DAG file %s written into DagCode table", fileloc)
         return dag_code
@@ -120,6 +125,21 @@ class DagCode(Base):
         :return: source code as string
         """
         return cls._get_code_from_db(dag_id, session=session)
+
+    @classmethod
+    def _read_source(cls, fileloc: str, bundle_name: str | None) -> str:
+        """Read a Dag file's source, through the Task SDK importer that claims the file if there is one."""
+        if Path(fileloc).suffix.lower() not in (".py", ".pyc"):
+            from airflow.dag_processing.importer_routing import read_claimed_source
+
+            try:
+                source = read_claimed_source(fileloc, bundle_name)
+            except Exception:
+                log.exception("Cannot read the Dag source of %s", fileloc)
+                return SOURCE_UNAVAILABLE
+            if source is not None:
+                return source or SOURCE_UNAVAILABLE
+        return cls.get_code_from_file(fileloc)
 
     @staticmethod
     def get_code_from_file(fileloc):
@@ -177,19 +197,27 @@ class DagCode(Base):
 
     @classmethod
     @provide_session
-    def update_source_code(cls, dag_id: str, fileloc: str, *, session: Session = NEW_SESSION) -> None:
+    def update_source_code(
+        cls,
+        dag_id: str,
+        fileloc: str,
+        *,
+        bundle_name: str | None = None,
+        session: Session = NEW_SESSION,
+    ) -> None:
         """
         Check if the source code of the DAG has changed and update it if needed.
 
         :param dag_id: Dag ID
         :param fileloc: The path of code file to read the code from
+        :param bundle_name: The Dag bundle of the file, whose importers may read its source
         :param session: The database session.
         :return: None
         """
         latest_dagcode = cls.get_latest_dagcode(dag_id, session=session)
         if not latest_dagcode:
             return
-        new_source_code = cls.get_code_from_file(fileloc)
+        new_source_code = cls._read_source(fileloc, bundle_name)
         new_source_code_hash = cls.dag_source_hash(new_source_code)
         if new_source_code_hash != latest_dagcode.source_code_hash:
             latest_dagcode.source_code = new_source_code
