@@ -3656,6 +3656,31 @@ def test_stub_task_args_round_trip():
         get_arg_bindings_adapter().validate_python(round_tripped.task_dict[task_id].arg_bindings)
 
 
+def test_stub_task_keeps_preset_arg_bindings():
+    """A stub that already carries ``_arg_bindings``, as one rebuilt from a Lang-SDK Dag does, keeps them."""
+    from airflow.sdk import task
+
+    with DAG(dag_id="preset_arg_bindings_dag", schedule=None) as dag:
+
+        @task.stub
+        def stage(): ...
+
+        @task.stub
+        def load(): ...
+
+        stage() >> load()
+
+    preset = [{"name": "from_staging.stage", "kind": "xcom", "task_id": "stage"}]
+    dag.task_dict["load"]._arg_bindings = preset
+
+    encoded_tasks = {
+        t[Encoding.VAR]["task_id"]: t[Encoding.VAR] for t in DagSerialization.to_dict(dag)["dag"]["tasks"]
+    }
+
+    assert encoded_tasks["load"]["_arg_bindings"] == preset
+    assert "_arg_bindings" not in encoded_tasks["stage"]
+
+
 @pytest.mark.parametrize("raw", ["false", "true", 0, 1, None, [], {"a": 1}])
 def test_task_is_stub_fails_closed_on_non_boolean(raw):
     """A task flag from a non-Python producer is never schema-validated, so it must fail closed."""

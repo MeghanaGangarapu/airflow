@@ -1070,11 +1070,12 @@ class OperatorSerialization(DAGNode, BaseSerialization):
             from airflow.serialization.stub_arg_bindings import build_arg_bindings
 
             serialize_op["is_stub"] = True
-            if (
-                not op.is_mapped
-                and isinstance(op, DecoratedOperator)
-                and (arg_bindings := build_arg_bindings(op))
-            ):
+            # A stub rebuilt from a Lang-SDK Dag carries the bindings its runtime serialized, whose
+            # names need not be Python identifiers, so they are kept rather than rebuilt.
+            arg_bindings = getattr(op, "_arg_bindings", None)
+            if arg_bindings is None and not op.is_mapped and isinstance(op, DecoratedOperator):
+                arg_bindings = build_arg_bindings(op)
+            if arg_bindings:
                 serialize_op["_arg_bindings"] = arg_bindings
 
         if op.start_trigger_args:
