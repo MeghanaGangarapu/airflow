@@ -46,6 +46,8 @@ from airflow_e2e_tests.e2e_test_utils.clients import AirflowClient
 _TS_TASK_TIMEOUT = 600
 
 _DAG_ID = "typescript_native_example"
+# The Dag trigger_downstream starts; see the triggerDagRun call in ts-sdk/example/src/native.ts.
+_DOWNSTREAM_DAG_ID = "typescript_example"
 
 # Read by the handlers; see ts-sdk/example/src/native.ts.
 _NORTH_ROWS_VARIABLE = "typescript_native_north_rows"
@@ -89,6 +91,8 @@ def completed_run(parsed_dag: AirflowClient) -> _CompletedRun:
     ):
         client.set_variable(key, value)
 
+    # Dags are paused at creation here, so the run trigger_downstream starts would stay queued.
+    client.un_pause_dag(_DOWNSTREAM_DAG_ID)
     client.un_pause_dag(_DAG_ID)
     resp = client.trigger_dag(_DAG_ID, json={"logical_date": datetime.now(timezone.utc).isoformat()})
     run_id = resp["dag_run_id"]
@@ -111,6 +115,14 @@ def test_the_dag_the_bundle_parsed_is_registered(parsed_dag: AirflowClient):
     assert dag.get("timetable_summary") == "0 0 * * *"
     # `tags` is a list of objects, each naming one tag.
     assert {tag["name"] for tag in dag.get("tags") or []} >= {"typescript", "native"}
+
+
+def test_the_dag_source_is_the_bundle_entry_module(parsed_dag: AirflowClient):
+    """The Code view shows the TypeScript the bundle was packed from, not the minified bundle."""
+    content = parsed_dag.get_dag_source(_DAG_ID)["content"]
+
+    assert "new Bundle()" in content
+    assert 'from "./native.js"' in content
 
 
 def test_the_graph_carries_every_construct(parsed_dag: AirflowClient):
@@ -174,6 +186,20 @@ def test_every_other_task_succeeded(completed_run: _CompletedRun):
         assert completed_run.ti_states.get(task_id) == "success", (
             f"{task_id!r} did not succeed. all task states: {completed_run.ti_states}"
         )
+
+
+def test_the_trigger_started_the_downstream_run(completed_run: _CompletedRun):
+    """A Python worker rebuilt ``trigger_downstream`` from the bundle and it triggered the Dag."""
+    run_id = completed_run.xcom("trigger_downstream", key="trigger_run_id")
+    client = completed_run.client
+
+    state = client.wait_for_dag_run(dag_id=_DOWNSTREAM_DAG_ID, run_id=run_id, timeout=_TS_TASK_TIMEOUT)
+    run = client.get_dag_run(_DOWNSTREAM_DAG_ID, run_id)
+
+    assert state == "success", f"expected the downstream run to succeed; got {run!r}"
+    assert run["run_type"] == "operator_triggered"
+    # The conf template is rendered on the worker, from the rebuilt operator.
+    assert run["conf"] == {"triggered_by": _DAG_ID}
 
 
 def test_xcoms_flow_between_typescript_tasks(completed_run: _CompletedRun):
