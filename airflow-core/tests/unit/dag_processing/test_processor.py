@@ -20,6 +20,7 @@ from __future__ import annotations
 import inspect
 import json
 import logging
+import os
 import pathlib
 import selectors
 import signal
@@ -3042,3 +3043,60 @@ def test_check_task_graph_rejects_a_cycle():
 )
 def test_check_task_graph_accepts_an_acyclic_graph(edges):
     _check_task_graph_is_acyclic(_build_graph_payload(edges))
+
+
+class TestLangSDKDagFileProcessorProcessSpawn:
+    """Where a bare fork is unsafe, a fresh interpreter finds the coordinator again and execs the runtime."""
+
+    @pytest.fixture(autouse=True)
+    def _spawn_a_fresh_interpreter(self, monkeypatch):
+        monkeypatch.setattr(supervisor, "_should_use_exec", lambda: True)
+        monkeypatch.setenv("PYTHONPATH", os.pathsep.join(sys.path))
+
+    @staticmethod
+    def _run(tmp_path, *, timeout: float = 120, **spec) -> DagFileParsingResult:
+        return LangSDKDagFileProcessorProcess.run(
+            coordinator=FakeCoordinator(),
+            path=write_native_file(tmp_path / "dag.native", **spec),
+            bundle_path=tmp_path,
+            bundle_name="testing",
+            dag_file_rel_path="dag.native",
+            timeout=timeout,
+            logger=structlog.get_logger(),
+        )
+
+    @patch("airflow.dag_processing.processor.os.fork", autospec=True)
+    def test_parses_through_the_coordinator_found_again(self, mock_fork, monkeypatch, tmp_path):
+        classpath = f"{FakeCoordinator.__module__}.FakeCoordinator"
+        monkeypatch.setenv("AIRFLOW__SDK__COORDINATORS", json.dumps({"fake": {"classpath": classpath}}))
+
+        result = self._run(tmp_path, dags=["native_dag"])
+
+        assert [dag.dag_id for dag in result.serialized_dags] == ["native_dag"]
+        mock_fork.assert_not_called()
+
+    def test_the_runtime_leads_its_own_process_group(self, monkeypatch, tmp_path):
+        classpath = f"{FakeCoordinator.__module__}.FakeCoordinator"
+        monkeypatch.setenv("AIRFLOW__SDK__COORDINATORS", json.dumps({"fake": {"classpath": classpath}}))
+        grandchild_pid_file = tmp_path / "grandchild.pid"
+
+        result = self._run(
+            tmp_path,
+            dags=["native_dag"],
+            grandchild_holds=120,
+            grandchild_pid_file=str(grandchild_pid_file),
+            timeout=30,
+        )
+
+        assert [dag.dag_id for dag in result.serialized_dags] == ["native_dag"]
+        _assert_process_ends(int(grandchild_pid_file.read_text()))
+
+    def test_reports_a_file_no_coordinator_claims(self, monkeypatch, tmp_path):
+        monkeypatch.delenv("AIRFLOW__SDK__COORDINATORS", raising=False)
+
+        result = self._run(tmp_path, dags=["native_dag"])
+
+        assert result.import_errors == {
+            "dag.native": "Cannot start the Lang-SDK runtime: "
+            f"RuntimeError: No coordinator's Dag importer claims {tmp_path / 'dag.native'}"
+        }

@@ -25,6 +25,7 @@ import logging
 import os
 import selectors
 import signal
+import sys
 import time
 import traceback
 from collections.abc import Callable, Sequence
@@ -48,6 +49,7 @@ from airflow.callbacks.callback_requests import (
 from airflow.configuration import conf
 from airflow.dag_processing.bundles.base import BundleVersionLock
 from airflow.dag_processing.dagbag import BundleDagBag, DagBag
+from airflow.dag_processing.importer_routing import get_claiming_coordinator
 from airflow.models.dag import DagModel
 from airflow.sdk.coordinators._materialize import materialize_dag
 from airflow.sdk.coordinators._subprocess import _is_connection_from_pid, _ResourceTracker, _start_server
@@ -779,9 +781,44 @@ def _exec_lang_sdk_runtime(
             report_schema_version=report_schema_version,
         )
     except BaseException as e:
-        with contextlib.suppress(BaseException):
-            status.sendall(json.dumps({"error": f"{type(e).__name__}: {e}"}).encode() + b"\n")
+        _report_start_failure(status, e)
     os._exit(127)
+
+
+def _report_start_failure(status: socket, error: BaseException) -> None:
+    with contextlib.suppress(BaseException):
+        status.sendall(json.dumps({"error": f"{type(error).__name__}: {error}"}).encode() + b"\n")
+
+
+_LANG_SDK_EXEC_BOOTSTRAP = "from airflow.dag_processing.processor import _exec_lang_sdk_runtime_main\n_exec_lang_sdk_runtime_main()\n"
+
+
+def _exec_lang_sdk_runtime_main() -> NoReturn:
+    """
+    Run in the fresh interpreter that replaces a forked Dag-parse child where fork is unsafe.
+
+    The interpreter cannot inherit the coordinator, so it finds the coordinator again from the
+    configuration: the one whose Dag importer claims the file.
+    """
+    status = socket(fileno=3)
+    status.set_inheritable(False)
+    args = json.loads(sys.argv[1])
+    (comm_host, comm_port), (logs_host, logs_port) = args["comm_address"], args["logs_address"]
+    try:
+        coordinator = get_claiming_coordinator(args["path"], args["bundle_name"])
+        if coordinator is None:
+            raise RuntimeError(f"No coordinator's Dag importer claims {args['path']}")
+    except BaseException as e:
+        _report_start_failure(status, e)
+        os._exit(127)
+    _exec_lang_sdk_runtime(
+        coordinator,
+        path=Path(args["path"]),
+        bundle_path=Path(args["bundle_path"]),
+        comm_address=(comm_host, comm_port),
+        logs_address=(logs_host, logs_port),
+        status=status,
+    )
 
 
 def _check_task_graph_is_acyclic(data: dict[str, Any]) -> None:
@@ -868,14 +905,26 @@ class LangSDKDagFileProcessorProcess(DagFileProcessorProcess):
             child_ends = (stdout_w, stderr_w, status_w)
             parent_ends = (comm_listener, logs_listener, stdout_r, stderr_r, status_r)
 
-            pid = os.fork()
-            if pid == 0:
+            comm_address = comm_listener.getsockname()[:2]
+            logs_address = logs_listener.getsockname()[:2]
+            if supervisor._should_use_exec():
+                pid = cls._spawn_child(
+                    path=Path(path),
+                    bundle_path=bundle_path,
+                    bundle_name=bundle_name,
+                    comm_address=comm_address,
+                    logs_address=logs_address,
+                    stdout=stdout_w,
+                    stderr=stderr_w,
+                    status=status_w,
+                )
+            elif (pid := os.fork()) == 0:
                 cls._run_child(
                     coordinator,
                     path=Path(path),
                     bundle_path=bundle_path,
-                    comm_address=comm_listener.getsockname()[:2],
-                    logs_address=logs_listener.getsockname()[:2],
+                    comm_address=comm_address,
+                    logs_address=logs_address,
                     parent_ends=parent_ends,
                     stdout=stdout_w,
                     stderr=stderr_w,
@@ -960,6 +1009,48 @@ class LangSDKDagFileProcessorProcess(DagFileProcessorProcess):
             finally:
                 proc.close()
         return cast("DagFileParsingResult", proc.parsing_result)
+
+    @staticmethod
+    def _spawn_child(
+        *,
+        path: Path,
+        bundle_path: Path,
+        bundle_name: str,
+        comm_address: tuple[str, int],
+        logs_address: tuple[str, int],
+        stdout: socket,
+        stderr: socket,
+        status: socket,
+    ) -> int:
+        """
+        Start a fresh interpreter that execs the runtime, where a bare fork is unsafe (macOS).
+
+        Its standard streams and the status socket are mapped onto fds 0 to 3, and it leads its own
+        process group, as part of the spawn.
+        """
+        args = {
+            "path": os.fspath(path),
+            "bundle_path": os.fspath(bundle_path),
+            "bundle_name": bundle_name,
+            "comm_address": list(comm_address),
+            "logs_address": list(logs_address),
+        }
+        devnull = os.open(os.devnull, os.O_RDONLY)
+        try:
+            return os.posix_spawn(
+                sys.executable,
+                [sys.executable, "-c", _LANG_SDK_EXEC_BOOTSTRAP, json.dumps(args)],
+                os.environ,
+                file_actions=[
+                    (os.POSIX_SPAWN_DUP2, devnull, 0),
+                    (os.POSIX_SPAWN_DUP2, stdout.fileno(), 1),
+                    (os.POSIX_SPAWN_DUP2, stderr.fileno(), 2),
+                    (os.POSIX_SPAWN_DUP2, status.fileno(), 3),
+                ],
+                setpgroup=0,
+            )
+        finally:
+            os.close(devnull)
 
     @staticmethod
     def _run_child(
