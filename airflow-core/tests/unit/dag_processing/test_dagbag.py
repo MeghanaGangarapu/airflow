@@ -1521,14 +1521,24 @@ class TestClaimedFiles:
         assert sorted(stat.file for stat in dagbag.dagbag_stats) == ["claimed.fake", "python_dag.py"]
         assert dagbag.import_errors == {}
 
-    def test_python_and_zip_files_stay_on_the_legacy_importer(self, tmp_path):
+    @pytest.mark.parametrize(
+        "importer_config",
+        [
+            pytest.param(FAKE_IMPORTER, id="default-extensions"),
+            pytest.param(
+                {"classpath": FAKE_IMPORTER, "extensions": [".fake", ".py", ".zip"]},
+                id="legacy-extensions-configured",
+            ),
+        ],
+    )
+    def test_python_and_zip_files_stay_on_the_legacy_importer(self, tmp_path, importer_config):
         (tmp_path / "claimed.fake").write_text("claimed_dag\n")
         (tmp_path / "python_dag.py").write_text(PY_DAG_SOURCE.format(dag_id="python_dag"))
         with zipfile.ZipFile(tmp_path / "packaged.zip", "w") as zf:
             zf.writestr("zipped_dag.py", PY_DAG_SOURCE.format(dag_id="zipped_dag"))
 
         with (
-            task_sdk_importers(FAKE_IMPORTER),
+            task_sdk_importers(importer_config),
             mock.patch.object(TaskSdkPythonDagImporter, "import_definition") as python_import,
             mock.patch.object(ZipImporter, "import_definition") as zip_import,
         ):
@@ -1552,18 +1562,32 @@ class TestClaimedFiles:
         assert dagbag.import_errors == {}
 
     def test_importer_that_cannot_load_is_an_import_error(self, tmp_path):
-        dag_file = tmp_path / "python_dag.py"
-        dag_file.write_text(PY_DAG_SOURCE.format(dag_id="python_dag"))
+        claimed = tmp_path / "claimed.fake"
+        claimed.write_text("claimed_dag\n")
 
-        with task_sdk_importers({"classpath": "unit.dag_processing.missing.Importer", "extensions": [".py"]}):
-            dagbag = DagBag(dag_folder=os.fspath(dag_file), bundle_path=tmp_path, bundle_name="testing")
+        with task_sdk_importers(
+            {"classpath": "unit.dag_processing.missing.Importer", "extensions": [".fake"]}
+        ):
+            dagbag = DagBag(dag_folder=os.fspath(claimed), bundle_path=tmp_path, bundle_name="testing")
 
         assert dagbag.dags == {}
-        assert list(dagbag.import_errors) == ["python_dag.py"]
+        assert list(dagbag.import_errors) == ["claimed.fake"]
         assert (
             "Failed to load DAG importer 'unit.dag_processing.missing.Importer'"
-            in (dagbag.import_errors["python_dag.py"])
+            in (dagbag.import_errors["claimed.fake"])
         )
+
+    def test_built_in_importer_claims_a_configured_extension(self, tmp_path):
+        claimed = tmp_path / "python_dag.dagpy"
+        claimed.write_text(PY_DAG_SOURCE.format(dag_id="python_dag"))
+
+        with task_sdk_importers(
+            {"classpath": "airflow.sdk.importers.PythonDagImporter", "extensions": [".dagpy"]}
+        ):
+            dagbag = DagBag(dag_folder=os.fspath(tmp_path), bundle_path=tmp_path, bundle_name="testing")
+
+        assert dagbag.dag_ids == ["python_dag"]
+        assert dagbag.dags["python_dag"].relative_fileloc == "python_dag.dagpy"
 
     def test_single_claimed_file_uses_the_bundle_importers(self, tmp_path):
         claimed = tmp_path / "claimed.fake"

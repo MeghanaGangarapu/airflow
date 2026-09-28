@@ -18,9 +18,9 @@
 """
 Route Dag files that a Task SDK importer claims.
 
-A file is claimed when its extension is registered to a Task SDK importer other than the default
-``PythonDagImporter`` and ``ZipImporter``. Every other file, including ``.py`` and ``.zip``, stays
-on the legacy importer in :mod:`airflow.dag_processing.importers`.
+A file is claimed when its extension is registered in the bundle's Task SDK importer registry,
+unless it is one of the legacy extensions ``.py``, ``.pyc`` and ``.zip``. Those always stay on the
+legacy importer in :mod:`airflow.dag_processing.importers`.
 """
 
 from __future__ import annotations
@@ -37,8 +37,6 @@ from airflow.sdk.importers import (
     DagImportError,
     DagImportResult,
     FilesystemDagDefinition,
-    PythonDagImporter,
-    ZipImporter,
     ZipMemberDagDefinition,
     get_file_suffix,
     get_importer_registry,
@@ -51,15 +49,19 @@ if TYPE_CHECKING:
 
 log = logging.getLogger(__name__)
 
-_DEFAULT_IMPORTER_TYPES: tuple[type[AbstractDagImporter[Any]], ...] = (PythonDagImporter, ZipImporter)
+LEGACY_EXTENSIONS = frozenset({".py", ".pyc", ".zip"})
 
 _reported_registry_failures: set[str | None] = set()
-_reported_load_failures: set[str] = set()
 
 
 @dataclass(frozen=True)
 class BundleRef:
-    """The part of a Dag bundle that importers read: its name and its root path."""
+    """
+    The part of a Dag bundle that importers read: its name and its root path.
+
+    Core passes it in place of a ``BaseDagBundle`` when it imports a single file, so an importer
+    must not rely on any other bundle attribute.
+    """
 
     name: str | None
     path: Path | None
@@ -74,35 +76,44 @@ def get_task_sdk_registry(bundle_name: str | None) -> DagImporterRegistry | None
     Return the Task SDK importer registry for a bundle, or ``None`` when it cannot be built.
 
     A broken importer configuration must not stop ``.py`` and ``.zip`` files from parsing, so the
-    failure is logged once per bundle and the caller keeps the legacy importer.
+    failure is logged once until the registry builds again, and the caller keeps the legacy importer.
     """
     try:
-        return get_importer_registry(bundle_name)
+        registry = get_importer_registry(bundle_name)
     except Exception:
         if bundle_name not in _reported_registry_failures:
             _reported_registry_failures.add(bundle_name)
             log.exception("Cannot build the Task SDK Dag importer registry for bundle %s", bundle_name)
         return None
+    _reported_registry_failures.discard(bundle_name)
+    return registry
+
+
+def _get_claimed_extensions(registry: DagImporterRegistry) -> list[str]:
+    return [ext for ext in registry.supported_extensions() if ext not in LEGACY_EXTENSIONS]
+
+
+def is_claimed(registry: DagImporterRegistry, path: str | os.PathLike[str]) -> bool:
+    """
+    Return whether a Task SDK importer claims ``path``, judged by its extension alone.
+
+    This loads no importer. A claimed file whose importer cannot be loaded is still claimed, and
+    parsing it reports the failure as an import error.
+    """
+    return get_file_suffix(Path(path)) in _get_claimed_extensions(registry)
 
 
 def claimed_importer(
     registry: DagImporterRegistry, path: str | os.PathLike[str]
 ) -> AbstractDagImporter[Any] | None:
     """
-    Return the Task SDK importer that claims ``path``, or ``None``.
-
-    Only registered extensions claim files; an importer that matches through ``can_handle`` alone
-    is not used.
+    Return the Task SDK importer that claims ``path``, or ``None`` when the file is not claimed.
 
     :raises AirflowConfigException: if the importer configured for the extension cannot be loaded.
     """
-    file_path = Path(path)
-    if get_file_suffix(file_path) not in registry.supported_extensions():
+    if not is_claimed(registry, path):
         return None
-    importer = registry.get_importer(file_path)
-    if importer is None or type(importer) in _DEFAULT_IMPORTER_TYPES:
-        return None
-    return importer
+    return registry.get_importer(Path(path))
 
 
 def _claimed_importer_or_none(
@@ -111,25 +122,13 @@ def _claimed_importer_or_none(
     try:
         return claimed_importer(registry, path)
     except Exception as e:
-        if (reason := str(e)) not in _reported_load_failures:
-            _reported_load_failures.add(reason)
-            log.exception("Cannot load the Dag importer for %s", path)
+        log.warning("Cannot load the Dag importer for %s: %s", path, e)
         return None
-
-
-def is_claimed(registry: DagImporterRegistry, path: str | os.PathLike[str]) -> bool:
-    """
-    Return whether a Task SDK importer claims ``path``.
-
-    An importer that fails to load counts as no claim. The file then keeps its legacy handling,
-    and parsing it reports the failure as an import error.
-    """
-    return _claimed_importer_or_none(registry, path) is not None
 
 
 def _claiming_importers(registry: DagImporterRegistry) -> list[AbstractDagImporter[Any]]:
     importers: list[AbstractDagImporter[Any]] = []
-    for ext in registry.supported_extensions():
+    for ext in _get_claimed_extensions(registry):
         # Any file name works: the registry routes by its suffix.
         importer = _claimed_importer_or_none(registry, f"_{ext}")
         if importer is not None and importer not in importers:
@@ -138,8 +137,8 @@ def _claiming_importers(registry: DagImporterRegistry) -> list[AbstractDagImport
 
 
 def has_claiming_importers(registry: DagImporterRegistry) -> bool:
-    """Return whether any registered extension belongs to a claiming Task SDK importer."""
-    return bool(_claiming_importers(registry))
+    """Return whether the registry claims any extension."""
+    return bool(_get_claimed_extensions(registry))
 
 
 def iter_claimed_paths(
