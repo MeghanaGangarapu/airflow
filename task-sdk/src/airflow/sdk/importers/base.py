@@ -439,13 +439,25 @@ class DagImporterRegistry:
         """
         Register the Dag importers of the coordinators that parse Dag files in *bundle_name*.
 
+        A coordinator configuration that cannot be loaded registers no coordinator importers, so
+        the bundle's other importers keep working.
+
         :raises AirflowConfigException: if two coordinators claim the same extension, since only
             one runtime can parse a file.
         """
         from airflow.sdk.execution_time.coordinator import get_coordinator_manager
 
+        try:
+            coordinators = get_coordinator_manager().for_bundle(bundle_name)
+        except Exception:
+            log.exception(
+                "Cannot load the [sdk] coordinators configuration; Dag bundle %r gets no coordinator "
+                "Dag importers",
+                bundle_name,
+            )
+            return
         claimed_by: dict[str, str] = {}
-        for key, coordinator in get_coordinator_manager().for_bundle(bundle_name).items():
+        for key, coordinator in coordinators.items():
             if (importer := coordinator.get_dag_importer()) is None:
                 continue
             for ext in _get_importer_extensions(importer):

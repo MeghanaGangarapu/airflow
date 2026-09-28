@@ -678,3 +678,21 @@ class TestCoordinatorDagImporters:
                 match=r"Coordinators 'jdk11' and 'jdk17' both parse \.jar files in Dag bundle 'test_bundle'",
             ):
                 DagImporterRegistry.from_config("test_bundle")
+
+    def test_a_broken_coordinator_configuration_keeps_the_other_importers(self, caplog):
+        config = {
+            **_coordinators(native={"extensions": [".native"]}),
+            ("sdk", "queue_to_coordinator"): json.dumps({"java": "missing"}),
+            ("dag_processor", "dag_importer_configs"): json.dumps(
+                [{"classpath": f"{__name__}.GlobalDagImporter", "extensions": [".custom"]}]
+            ),
+        }
+        with conf_vars(config), caplog.at_level(logging.ERROR, logger="airflow.sdk.importers.base"):
+            registry = DagImporterRegistry.from_config("test_bundle")
+
+        assert isinstance(registry.get_importer("dag.custom"), GlobalDagImporter)
+        assert registry.get_importer("dag.native") is None
+        assert [r.getMessage() for r in caplog.records if r.name == "airflow.sdk.importers.base"] == [
+            "Cannot load the [sdk] coordinators configuration; Dag bundle 'test_bundle' gets no "
+            "coordinator Dag importers"
+        ]
