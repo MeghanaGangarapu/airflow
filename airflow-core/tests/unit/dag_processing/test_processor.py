@@ -18,10 +18,14 @@
 from __future__ import annotations
 
 import inspect
+import json
 import logging
 import pathlib
+import selectors
+import signal
 import sys
 import textwrap
+import time
 import typing
 import uuid
 from collections.abc import Callable, Iterable
@@ -55,6 +59,7 @@ from airflow.dag_processing.processor import (
     DagFileParseRequest,
     DagFileParsingResult,
     DagFileProcessorProcess,
+    LangSDKDagFileProcessorProcess,
     ToDagProcessor,
     ToManager,
     _execute_callbacks,
@@ -90,6 +95,7 @@ from airflow.utils.state import TaskInstanceState
 
 from tests_common.test_utils.config import conf_vars, env_vars
 from unit.dag_processing.fake_importers import FAKE_IMPORTER, task_sdk_importers
+from unit.dag_processing.fake_lang_sdk import SCHEMA_VERSION, FakeCoordinator, write_native_file
 
 if TYPE_CHECKING:
     from kgb import SpyAgency
@@ -2622,3 +2628,172 @@ class TestMultiTeamCallbackMetrics:
             "dag.callback_exceptions",
             tags={"dag_id": "test_dag"},
         )
+
+
+def _service_once(selector) -> None:
+    """Service one selector pass, as the Dag processor manager does."""
+    for key, _ in selector.select(timeout=0.1):
+        socket_handler, on_close = key.data
+        if not socket_handler(key.fileobj):
+            on_close(key.fileobj)
+            key.fileobj.close()
+
+
+def _service_until_ready(proc: LangSDKDagFileProcessorProcess, selector, timeout: float = 30.0) -> None:
+    deadline = time.monotonic() + timeout
+    while not proc.is_ready:
+        assert time.monotonic() < deadline, "the Lang-SDK parse did not finish"
+        _service_once(selector)
+
+
+class TestLangSDKDagFileProcessorProcess:
+    @pytest.fixture
+    def selector(self):
+        with selectors.DefaultSelector() as selector:
+            yield selector
+
+    @pytest.fixture
+    def start(self, tmp_path, selector):
+        started = []
+
+        def _start(client=None, **spec) -> LangSDKDagFileProcessorProcess:
+            path = write_native_file(tmp_path / "dag.native", **spec)
+            proc = LangSDKDagFileProcessorProcess.start(
+                id=uuid.uuid4(),
+                coordinator=FakeCoordinator(),
+                path=path,
+                bundle_path=tmp_path,
+                bundle_name="testing",
+                dag_file_rel_path="dag.native",
+                selector=selector,
+                logger=structlog.get_logger(),
+                client=client or MagicMock(spec=Client),
+            )
+            started.append(proc)
+            return proc
+
+        yield _start
+        for proc in started:
+            proc.kill(signal.SIGKILL)
+            for sock in list(proc._open_sockets):
+                sock.close()
+
+    def test_parses_a_dag_with_the_runtime(self, start, selector, tmp_path):
+        proc = start(dags=["native_dag"])
+
+        _service_until_ready(proc, selector)
+
+        assert proc.parsing_result is not None
+        assert proc.parsing_result.import_errors is None
+        [dag] = proc.parsing_result.serialized_dags
+        assert dag.dag_id == "native_dag"
+        assert dag.data["dag"]["relative_fileloc"] == "dag.native"
+        request = json.loads(dag.data["dag"]["description"])["request"]
+        assert request["type"] == "DagFileParseRequest"
+        assert request["file"] == str(tmp_path / "dag.native")
+        assert proc._subprocess_schema_version == SCHEMA_VERSION
+        assert not proc._open_sockets
+
+    @patch.object(LangSDKDagFileProcessorProcess, "_serialize_response", autospec=True)
+    def test_request_is_downgraded_to_the_runtime_schema_version(self, mock_serialize, start, selector):
+        seen = []
+
+        def _serialize(proc, msg, **dump_opts):
+            seen.append((type(msg).__name__, proc._subprocess_schema_version))
+            return msg.model_dump(**dump_opts)
+
+        mock_serialize.side_effect = _serialize
+        proc = start(dags=["native_dag"])
+
+        _service_until_ready(proc, selector)
+
+        assert seen[0] == ("DagFileParseRequest", SCHEMA_VERSION)
+
+    def test_get_variable_is_answered_by_the_client(self, start, selector):
+        client = MagicMock(spec=Client)
+        client.variables = MagicMock()
+        client.variables.get.return_value = VariableResponse(key="native_var", value="from-db")
+        proc = start(client=client, dags=["native_dag"], get_variable="native_var")
+
+        _service_until_ready(proc, selector)
+
+        [dag] = proc.parsing_result.serialized_dags
+        reply = json.loads(dag.data["dag"]["description"])["reply"]
+        assert reply["body"]["value"] == "from-db"
+        client.variables.get.assert_called_once_with("native_var")
+
+    def test_a_dag_that_does_not_deserialize_is_an_import_error(self, start, selector):
+        proc = start(dags=["broken_dag"], invalid=True)
+
+        _service_until_ready(proc, selector)
+
+        assert proc.parsing_result.serialized_dags == []
+        [message] = proc.parsing_result.import_errors.values()
+        assert message.startswith("Cannot load the serialized Dag 'broken_dag': ")
+
+    def test_runtime_import_errors_are_kept(self, start, selector):
+        proc = start(dags=[], import_errors={"dag.native": "native Dag failed"})
+
+        _service_until_ready(proc, selector)
+
+        assert proc.parsing_result.import_errors == {"dag.native": "native Dag failed"}
+
+    @pytest.mark.parametrize(
+        ("spec", "error"),
+        [
+            pytest.param({"command_error": "no runtime"}, "FileNotFoundError: no runtime", id="command"),
+            pytest.param(
+                {"schema_version": "1999-01-01"},
+                "ValueError: Version '1999-01-01' not found in supervisor schema bundle",
+                id="schema-version",
+            ),
+        ],
+    )
+    def test_a_runtime_that_cannot_start_is_an_import_error(self, start, selector, spec, error):
+        proc = start(**spec)
+
+        _service_until_ready(proc, selector)
+
+        assert proc.parsing_result.import_errors == {
+            "dag.native": f"Cannot start the Lang-SDK runtime: {error}"
+        }
+        assert proc._exit_code == 127
+
+    def test_a_runtime_that_exits_without_a_result_is_an_import_error(self, start, selector):
+        proc = start(exit_before_connect=3)
+
+        _service_until_ready(proc, selector)
+
+        assert proc.parsing_result.import_errors == {
+            "dag.native": "The Lang-SDK runtime exited with code 3 without a parse result"
+        }
+        assert not proc._open_sockets
+
+    def test_kill_before_the_runtime_connects_closes_the_listeners(self, start, selector):
+        proc = start(dags=["native_dag"])
+        proc._process.send_signal(signal.SIGSTOP)
+        listeners = [s for s, kind in proc._open_sockets.items() if kind.endswith("-listener")]
+
+        proc.kill(signal.SIGKILL)
+
+        # cleanup_sockets_after_kill() calls the handler until it returns False.
+        assert proc._accept_connection(listeners[0], kind="comm") is False
+        proc.close()
+        assert len(listeners) == 2
+        assert all(listener.fileno() == -1 for listener in listeners)
+        assert not proc._open_sockets
+
+    @patch("airflow.dag_processing.processor._is_connection_from_pid", autospec=True)
+    def test_a_connection_is_used_only_once_verified(self, mock_owned, start, selector):
+        mock_owned.return_value = False
+        proc = start(dags=["native_dag"])
+        deadline = time.monotonic() + 30
+        while len(proc._unverified_connections) < 2:
+            assert time.monotonic() < deadline
+            _service_once(selector)
+        assert proc.stdin is None
+
+        mock_owned.return_value = True
+        _service_until_ready(proc, selector)
+
+        assert [dag.dag_id for dag in proc.parsing_result.serialized_dags] == ["native_dag"]

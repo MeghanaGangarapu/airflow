@@ -17,15 +17,23 @@
 from __future__ import annotations
 
 import contextlib
+import copy
+import functools
 import importlib
+import json
 import logging
 import os
+import selectors
+import signal
+import time
 import traceback
 from collections.abc import Callable, Sequence
 from pathlib import Path
-from typing import TYPE_CHECKING, Annotated, BinaryIO, ClassVar, Literal
+from socket import socket, socketpair
+from typing import TYPE_CHECKING, Annotated, Any, BinaryIO, ClassVar, Literal, NoReturn
 
 import attrs
+import psutil
 from pydantic import BaseModel, Field, TypeAdapter
 
 from airflow._shared.observability.metrics import stats
@@ -39,6 +47,7 @@ from airflow.configuration import conf
 from airflow.dag_processing.bundles.base import BundleVersionLock
 from airflow.dag_processing.dagbag import BundleDagBag, DagBag
 from airflow.models.dag import DagModel
+from airflow.sdk.coordinators._subprocess import _is_connection_from_pid, _ResourceTracker, _start_server
 from airflow.sdk.exceptions import TaskNotFound
 from airflow.sdk.execution_time import supervisor
 from airflow.sdk.execution_time.comms import (
@@ -71,7 +80,14 @@ from airflow.sdk.execution_time.comms import (
     XComSequenceIndexResult,
     XComSequenceSliceResult,
 )
-from airflow.sdk.execution_time.supervisor import WatchedSubprocess, register_request_method
+from airflow.sdk.execution_time.supervisor import (
+    PsutilTracker,
+    WatchedSubprocess,
+    length_prefixed_frame_reader,
+    make_buffered_socket_reader,
+    process_log_messages_from_subprocess,
+    register_request_method,
+)
 from airflow.sdk.execution_time.task_runner import RuntimeTaskInstance, _send_error_email_notification
 from airflow.serialization.serialized_objects import DagSerialization, LazyDeserializedDAG
 from airflow.utils.dag_version_inflation_checker import (
@@ -85,13 +101,12 @@ from airflow.utils.log.logging_mixin import LoggingMixin
 from airflow.utils.state import TaskInstanceState
 
 if TYPE_CHECKING:
-    from socket import socket
-
     from structlog.typing import FilteringBoundLogger
 
     from airflow.api_fastapi.execution_api.app import InProcessExecutionAPI
     from airflow.sdk.api.client import Client
     from airflow.sdk.bases.operator import BaseOperator
+    from airflow.sdk.coordinators._subprocess import SubprocessCoordinator
     from airflow.sdk.definitions.context import Context
     from airflow.sdk.definitions.dag import DAG
     from airflow.sdk.definitions.mappedoperator import MappedOperator
@@ -730,3 +745,348 @@ class DagFileProcessorProcess(WatchedSubprocess, LoggingMixin):
                 self.dag_file_rel_path,
                 exc_info=True,
             )
+
+
+def _exec_lang_sdk_runtime(
+    coordinator: SubprocessCoordinator,
+    *,
+    path: Path,
+    bundle_path: Path,
+    comm_address: tuple[str, int],
+    logs_address: tuple[str, int],
+    status: socket,
+) -> NoReturn:
+    """
+    Replace this Dag-parse child with the coordinator's runtime.
+
+    The runtime's schema version, or the reason it cannot start, is written to *status* as a JSON
+    line. The socket is closed on exec, which tells the parent that the runtime started.
+    """
+
+    def report_schema_version(schema_version: str | None) -> None:
+        status.sendall(json.dumps({"schema_version": schema_version}).encode() + b"\n")
+
+    try:
+        coordinator.parse_dag(
+            path=path,
+            bundle_path=bundle_path,
+            comm_address=comm_address,
+            logs_address=logs_address,
+            report_schema_version=report_schema_version,
+        )
+    except BaseException as e:
+        with contextlib.suppress(BaseException):
+            status.sendall(json.dumps({"error": f"{type(e).__name__}: {e}"}).encode() + b"\n")
+    os._exit(127)
+
+
+def _get_dag_id(data: Any) -> str | None:
+    try:
+        return data["dag"]["dag_id"]
+    except (KeyError, TypeError):
+        return None
+
+
+@attrs.define(kw_only=True)
+class LangSDKDagFileProcessorProcess(DagFileProcessorProcess):
+    """
+    Parse a native Lang-SDK Dag file with its coordinator's runtime.
+
+    The parse child execs the runtime instead of running Python, and the runtime answers the
+    ``DagFileParseRequest`` itself. It connects back to two listeners this process owns, so the
+    request is sent once the runtime has connected and its schema version is known.
+    """
+
+    stdin: socket | None = None  # type: ignore[assignment]
+    """The runtime's comm connection, set once the runtime connects."""
+
+    client: Client | None = None  # type: ignore[assignment]
+
+    logger_filehandle: BinaryIO | None = None  # type: ignore[assignment]
+
+    _fileloc: str = attrs.field(default="", init=False)
+    _parse_request: DagFileParseRequest | None = attrs.field(default=None, init=False)
+    _schema_version_known: bool = attrs.field(default=False, init=False)
+    _status_buffer: bytearray = attrs.field(factory=bytearray, init=False)
+    _unverified_connections: list[tuple[socket, socket, str]] = attrs.field(factory=list, init=False)
+
+    @classmethod
+    def start(  # type: ignore[override]
+        cls,
+        *,
+        coordinator: SubprocessCoordinator,
+        path: str | os.PathLike[str],
+        bundle_path: Path,
+        bundle_name: str,
+        dag_file_rel_path: str,
+        selector: selectors.BaseSelector,
+        logger: FilteringBoundLogger,
+        **kwargs,
+    ) -> Self:
+        with _ResourceTracker(timeout=0) as tracker:
+            comm_listener, logs_listener = tracker.track(_start_server(), _start_server())
+            comm_listener.setblocking(False)
+            logs_listener.setblocking(False)
+            stdout_r, stdout_w = tracker.track(*socketpair())
+            stderr_r, stderr_w = tracker.track(*socketpair())
+            status_r, status_w = tracker.track(*socketpair())
+            child_ends = (stdout_w, stderr_w, status_w)
+            parent_ends = (comm_listener, logs_listener, stdout_r, stderr_r, status_r)
+
+            pid = os.fork()
+            if pid == 0:
+                cls._run_child(
+                    coordinator,
+                    path=Path(path),
+                    bundle_path=bundle_path,
+                    comm_address=comm_listener.getsockname()[:2],
+                    logs_address=logs_listener.getsockname()[:2],
+                    parent_ends=parent_ends,
+                    stdout=stdout_w,
+                    stderr=stderr_w,
+                    status=status_w,
+                )
+            for sock in tracker.untrack(*child_ends):
+                sock.close()
+
+            proc = cls(
+                pid=pid,
+                process=PsutilTracker(psutil.Process(pid)),
+                process_log=logger,
+                start_time=time.monotonic(),
+                selector=selector,
+                bundle_name=bundle_name,
+                dag_file_rel_path=dag_file_rel_path,
+                **kwargs,
+            )
+            proc._register_runtime_sockets(
+                stdout=stdout_r,
+                stderr=stderr_r,
+                status=status_r,
+                comm_listener=comm_listener,
+                logs_listener=logs_listener,
+            )
+            tracker.untrack(*parent_ends)
+
+        proc._fileloc = os.fspath(path)
+        proc._parse_request = DagFileParseRequest(
+            file=os.fspath(path), bundle_path=bundle_path, bundle_name=bundle_name
+        )
+        return proc
+
+    @staticmethod
+    def _run_child(
+        coordinator: SubprocessCoordinator,
+        *,
+        path: Path,
+        bundle_path: Path,
+        comm_address: tuple[str, int],
+        logs_address: tuple[str, int],
+        parent_ends: tuple[socket, ...],
+        stdout: socket,
+        stderr: socket,
+        status: socket,
+    ) -> NoReturn:
+        try:
+            supervisor._reset_signals()
+            signal.pthread_sigmask(signal.SIG_SETMASK, set())
+            for sock in parent_ends:
+                sock.close()
+            devnull = os.open(os.devnull, os.O_RDONLY)
+            os.dup2(devnull, 0)
+            os.dup2(stdout.fileno(), 1)
+            os.dup2(stderr.fileno(), 2)
+            _exec_lang_sdk_runtime(
+                coordinator,
+                path=path,
+                bundle_path=bundle_path,
+                comm_address=comm_address,
+                logs_address=logs_address,
+                status=status,
+            )
+        finally:
+            os._exit(127)
+
+    def _register_runtime_sockets(
+        self,
+        *,
+        stdout: socket,
+        stderr: socket,
+        status: socket,
+        comm_listener: socket,
+        logs_listener: socket,
+    ) -> None:
+        self._open_sockets.update(
+            (
+                (stdout, "stdout"),
+                (stderr, "stderr"),
+                (status, "status"),
+                (comm_listener, "comm-listener"),
+                (logs_listener, "logs-listener"),
+            )
+        )
+        target_loggers = self._get_target_loggers()
+        self.selector.register(
+            stdout, selectors.EVENT_READ, self._create_log_forwarder(target_loggers, "task.stdout", data=b"")
+        )
+        self.selector.register(
+            stderr,
+            selectors.EVENT_READ,
+            self._create_log_forwarder(target_loggers, "task.stderr", data=b"", log_level=logging.ERROR),
+        )
+        self.selector.register(status, selectors.EVENT_READ, (self._read_status, self._on_socket_closed))
+        for listener, kind in ((comm_listener, "comm"), (logs_listener, "logs")):
+            self.selector.register(
+                listener,
+                selectors.EVENT_READ,
+                (functools.partial(self._accept_connection, kind=kind), self._on_socket_closed),
+            )
+
+    def _accept_connection(self, listener: socket, *, kind: str) -> bool:
+        try:
+            conn, _ = listener.accept()
+        except BlockingIOError:
+            # cleanup_sockets_after_kill() calls this until it returns False.
+            return self._exit_code is None
+        conn.setblocking(True)
+        self._unverified_connections.append((conn, listener, kind))
+        self._verify_connections()
+        return True
+
+    def _verify_connections(self) -> None:
+        """
+        Use each accepted connection once it is confirmed to come from the runtime.
+
+        A connection that is not visible yet stays pending and is checked again on the next
+        ``is_ready`` poll, so the caller's loop never waits here.
+        """
+        pending = []
+        for conn, listener, kind in self._unverified_connections:
+            if listener.fileno() == -1:
+                # The runtime already connected this channel.
+                conn.close()
+                continue
+            try:
+                owned = _is_connection_from_pid(conn, self.pid)
+            except OSError:
+                conn.close()
+                continue
+            if not owned:
+                pending.append((conn, listener, kind))
+                continue
+            self._on_socket_closed(listener)
+            listener.close()
+            if kind == "comm":
+                self._register_comm(conn)
+            else:
+                self._register_logs(conn)
+        self._unverified_connections = pending
+
+    def _register_comm(self, conn: socket) -> None:
+        self.stdin = conn
+        self._open_sockets[conn] = "requests"
+        self.selector.register(
+            conn,
+            selectors.EVENT_READ,
+            length_prefixed_frame_reader(
+                self.handle_requests(self.process_log), on_close=self._on_socket_closed
+            ),
+        )
+        self._send_parse_request()
+
+    def _register_logs(self, conn: socket) -> None:
+        self._open_sockets[conn] = "logs"
+        self.selector.register(
+            conn,
+            selectors.EVENT_READ,
+            make_buffered_socket_reader(
+                process_log_messages_from_subprocess(self._get_target_loggers()),
+                on_close=self._on_socket_closed,
+            ),
+        )
+
+    def _read_status(self, sock: socket) -> bool:
+        if chunk := sock.recv(4096):
+            self._status_buffer.extend(chunk)
+            return True
+        try:
+            status = json.loads(self._status_buffer.splitlines()[-1])
+        except (IndexError, ValueError):
+            status = {"error": "the parse process exited before starting the runtime"}
+        if "error" in status:
+            self._set_import_error(f"Cannot start the Lang-SDK runtime: {status['error']}")
+        else:
+            self._subprocess_schema_version = status["schema_version"]
+            self._schema_version_known = True
+            self._send_parse_request()
+        return False
+
+    def _send_parse_request(self) -> None:
+        if not self._schema_version_known or self.stdin is None or self._parse_request is None:
+            return
+        request, self._parse_request = self._parse_request, None
+        self.send_msg(request, request_id=0)
+
+    def _set_import_error(self, message: str) -> None:
+        self.parsing_result = DagFileParsingResult(
+            fileloc=self._fileloc,
+            serialized_dags=[],
+            import_errors={self.dag_file_rel_path: message},
+        )
+
+    def _handle_parsing_result(
+        self, msg: DagFileParsingResult, log: FilteringBoundLogger, req_id: int
+    ) -> RequestResult:
+        import_errors = dict(msg.import_errors or {})
+        serialized_dags = []
+        for dag in msg.serialized_dags:
+            try:
+                DagSerialization.validate_schema(dag.data)
+                DagSerialization.from_dict(copy.deepcopy(dag.data))
+            except Exception as e:
+                message = (
+                    f"Cannot load the serialized Dag {_get_dag_id(dag.data)!r}: "
+                    f"{type(e).__name__}: {getattr(e, 'message', e)}"
+                )
+                self.process_log.warning(message)
+                previous = import_errors.get(self.dag_file_rel_path)
+                import_errors[self.dag_file_rel_path] = f"{previous}\n{message}" if previous else message
+                continue
+            serialized_dags.append(dag)
+        self.parsing_result = msg.model_copy(
+            update={"serialized_dags": serialized_dags, "import_errors": import_errors or None}
+        )
+        return None, {}
+
+    @property
+    def is_ready(self) -> bool:
+        self._verify_connections()
+        if self._check_subprocess_exit() is None:
+            return False
+        self._close_unused_connections()
+        if self._open_sockets:
+            return False
+        if self.parsing_result is None:
+            self._set_import_error(
+                f"The Lang-SDK runtime exited with code {self._exit_code} without a parse result"
+            )
+        return True
+
+    def _close_unused_connections(self) -> None:
+        """Close the listeners of a runtime that never connected, and connections never verified."""
+        for sock, socket_type in list(self._open_sockets.items()):
+            if socket_type.endswith("-listener"):
+                self._on_socket_closed(sock)
+                sock.close()
+        for conn, _, _ in self._unverified_connections:
+            conn.close()
+        self._unverified_connections = []
+
+    def close(self) -> None:
+        for conn, _, _ in self._unverified_connections:
+            conn.close()
+        self._unverified_connections = []
+        if self.logger_filehandle is None:
+            self.cleanup_sockets_after_kill()
+        else:
+            super().close()
