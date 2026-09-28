@@ -912,6 +912,26 @@ class TestClassifyArtifactSource:
         mock_manager.is_bundle_configured.assert_called_once_with("artifacts")
 
 
+class TestServesBundle:
+    def test_explicit_root_serves_no_bundle(self):
+        coordinator = _StubSubprocessCoordinator(command=["x"], explicit_roots=[pathlib.Path("/artifacts")])
+        assert coordinator.serves_bundle("dags-folder") is False
+
+    def test_task_bundle_serves_every_bundle(self):
+        coordinator = _StubSubprocessCoordinator(command=["x"], explicit_roots=[])
+        assert coordinator.serves_bundle("dags-folder") is True
+        assert coordinator.serves_bundle("other-bundle") is True
+
+    @patch("airflow.sdk.coordinators._subprocess.DagBundlesManager")
+    def test_named_bundle_serves_only_its_bundle(self, mock_manager):
+        mock_manager.is_bundle_configured.return_value = True
+        coordinator = _StubSubprocessCoordinator(
+            command=["x"], explicit_roots=[], dag_bundle_name="artifacts"
+        )
+        assert coordinator.serves_bundle("artifacts") is True
+        assert coordinator.serves_bundle("dags-folder") is False
+
+
 class TestInitRootSource:
     """Execute-time root resolution, dispatched on the classified mode."""
 

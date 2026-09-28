@@ -52,6 +52,14 @@ class _ExplodingCoordinator(BaseCoordinator):
         raise RuntimeError("This coordinator must not be instantiated")
 
 
+class _BundleCoordinator(BaseCoordinator):
+    def __init__(self, *, bundles: list[str]):
+        self.bundles = bundles
+
+    def serves_bundle(self, bundle_name: str) -> bool:
+        return bundle_name in self.bundles
+
+
 @pytest.fixture
 def sdk_config(monkeypatch):
     """Set the ``[sdk]`` env vars consumed by :meth:`CoordinatorManager.from_config`.
@@ -256,6 +264,75 @@ class TestCoordinatorManager:
             "pod_template_file": "/opt/airflow/pod_templates/boom.yaml"
         }
         assert manager._created_coordinators == {}
+
+
+class TestForBundle:
+    @pytest.fixture(autouse=True)
+    def _reset_cache(self):
+        reset_coordinator_manager()
+        yield
+        reset_coordinator_manager()
+
+    def test_base_coordinator_parses_no_native_dags(self):
+        coordinator = _CoordinatorB()
+
+        assert coordinator.get_dag_importer() is None
+        assert coordinator.serves_bundle("dags-folder") is False
+
+    def test_returns_serving_coordinators_in_config_order(self, sdk_config):
+        classpath = f"{_BundleCoordinator.__module__}._BundleCoordinator"
+        sdk_config(
+            coordinators=json.dumps(
+                {
+                    "second": {"classpath": classpath, "kwargs": {"bundles": ["dags-folder"]}},
+                    "other": {"classpath": classpath, "kwargs": {"bundles": ["other-bundle"]}},
+                    "first": {"classpath": classpath, "kwargs": {"bundles": ["dags-folder"]}},
+                }
+            )
+        )
+        manager = CoordinatorManager.from_config()
+
+        coordinators = manager.for_bundle("dags-folder")
+
+        assert list(coordinators) == ["second", "first"]
+        assert coordinators["second"] is manager._created_coordinators["second"]
+
+    def test_skips_a_coordinator_that_cannot_be_built(self, sdk_config):
+        sdk_config(
+            coordinators=json.dumps(
+                {
+                    "broken": {"classpath": f"{_ExplodingCoordinator.__module__}._ExplodingCoordinator"},
+                    "good": {
+                        "classpath": f"{_BundleCoordinator.__module__}._BundleCoordinator",
+                        "kwargs": {"bundles": ["dags-folder"]},
+                    },
+                }
+            )
+        )
+
+        with mock.patch("airflow.sdk.execution_time.coordinator.log") as log:
+            coordinators = CoordinatorManager.from_config().for_bundle("dags-folder")
+
+        assert list(coordinators) == ["good"]
+        log.exception.assert_called_once_with(
+            "Cannot load coordinator; skipping it for Dag parsing", coordinator="broken"
+        )
+
+    def test_reset_coordinator_manager_also_resets_importer_registries(self):
+        from airflow.sdk.importers import get_importer_registry
+
+        get_importer_registry("dags-folder")
+        reset_coordinator_manager()
+
+        assert get_importer_registry.cache_info().currsize == 0
+
+    def test_reset_importer_registry_also_resets_coordinator_manager(self):
+        from airflow.sdk.importers import reset_importer_registry
+
+        get_coordinator_manager()
+        reset_importer_registry()
+
+        assert get_coordinator_manager.cache_info().currsize == 0
 
 
 class TestConfigYamlCoordinatorsExample:

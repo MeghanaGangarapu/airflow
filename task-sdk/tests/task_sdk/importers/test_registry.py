@@ -27,6 +27,7 @@ from types import SimpleNamespace
 import pytest
 
 from airflow.sdk.exceptions import AirflowConfigException
+from airflow.sdk.execution_time.coordinator import BaseCoordinator
 from airflow.sdk.importers import (
     AbstractDagImporter,
     DagDefinition,
@@ -82,6 +83,33 @@ class LazyTestImporter(PythonDagImporter):
         super().__init__()
         self.kwargs = kwargs
         LazyTestImporter.instances += 1
+
+
+class NativeDagImporter(CustomBundleNonExtensionImporter):
+    """An importer a coordinator hands out for its native Dag files."""
+
+    def __init__(self, extensions: list[str]):
+        self.supported_extensions = extensions
+
+
+class NativeCoordinator(BaseCoordinator):
+    def __init__(self, *, extensions: list[str] | None = None, bundles: list[str] | None = None):
+        self.extensions = extensions
+        self.bundles = bundles or ["test_bundle"]
+
+    def serves_bundle(self, bundle_name: str) -> bool:
+        return bundle_name in self.bundles
+
+    def get_dag_importer(self) -> NativeDagImporter | None:
+        return None if self.extensions is None else NativeDagImporter(self.extensions)
+
+
+def _coordinators(**kwargs_by_key: dict) -> dict[tuple[str, str], str]:
+    specs = {
+        key: {"classpath": f"{__name__}.NativeCoordinator", "kwargs": kwargs}
+        for key, kwargs in kwargs_by_key.items()
+    }
+    return {("sdk", "coordinators"): json.dumps(specs)}
 
 
 class TestDagImporterRegistry:
@@ -600,3 +628,53 @@ class TestDagImporterRegistry:
         items = [item for _, item in registry.list_dag_definitions(_bundle(tmp_path))]
         assert [type(item) for item in items] == [DagImportError]
         assert items[0].error_type == "zip_read_error"
+
+
+class TestCoordinatorDagImporters:
+    @pytest.fixture(autouse=True)
+    def _clean_registry(self):
+        reset_importer_registry()
+        yield
+        reset_importer_registry()
+
+    def test_registers_the_importer_of_a_coordinator_serving_the_bundle(self):
+        with conf_vars(_coordinators(native={"extensions": [".native"]})):
+            importer = DagImporterRegistry.from_config("test_bundle").get_importer("dag.native")
+
+        assert isinstance(importer, NativeDagImporter)
+
+    def test_skips_a_coordinator_without_an_importer(self):
+        with conf_vars(_coordinators(native={})):
+            registry = DagImporterRegistry.from_config("test_bundle")
+
+        assert registry.get_importer("dag.native") is None
+
+    @pytest.mark.parametrize("bundle_name", [None, "other_bundle"])
+    def test_skips_coordinators_that_do_not_serve_the_bundle(self, bundle_name):
+        with conf_vars(_coordinators(native={"extensions": [".native"]})):
+            registry = DagImporterRegistry.from_config(bundle_name)
+
+        assert registry.get_importer("dag.native") is None
+
+    def test_importer_configs_override_a_coordinator_importer(self):
+        with conf_vars(
+            {
+                **_coordinators(native={"extensions": [".native"]}),
+                ("dag_processor", "dag_importer_configs"): json.dumps(
+                    [{"classpath": f"{__name__}.GlobalDagImporter", "extensions": [".native"]}]
+                ),
+            }
+        ):
+            importer = DagImporterRegistry.from_config("test_bundle").get_importer("dag.native")
+
+        assert isinstance(importer, GlobalDagImporter)
+
+    def test_two_coordinators_claiming_one_extension_raise(self):
+        with conf_vars(
+            _coordinators(jdk11={"extensions": [".jar"]}, jdk17={"extensions": [".jar", ".native"]})
+        ):
+            with pytest.raises(
+                AirflowConfigException,
+                match=r"Coordinators 'jdk11' and 'jdk17' both parse \.jar files in Dag bundle 'test_bundle'",
+            ):
+                DagImporterRegistry.from_config("test_bundle")

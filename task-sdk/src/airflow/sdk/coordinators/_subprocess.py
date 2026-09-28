@@ -498,6 +498,17 @@ class SubprocessCoordinator(BaseCoordinator):
             configured_roots=[str(root) for root in self._configured_roots],
         )
 
+    def serves_bundle(self, bundle_name: str) -> bool:
+        """
+        Return whether this coordinator's Dag importer parses Dag files in *bundle_name*.
+
+        A named bundle serves only itself and the task's own bundle serves every bundle. An
+        explicit root lies outside any Dag bundle, so it serves none.
+        """
+        if self._artifact_source is _ArtifactSource.NAMED_BUNDLE:
+            return self.dag_bundle_name == bundle_name
+        return self._artifact_source is _ArtifactSource.TASK_BUNDLE
+
     def _init_root_source(
         self, bundle_info: BundleInfo, logger: FilteringBoundLogger
     ) -> tuple[list[pathlib.Path], BaseDagBundle | None]:

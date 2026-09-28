@@ -16,24 +16,17 @@
 # specific language governing permissions and limitations
 # under the License.
 """
-Runtime coordinator for non-Python DAG file processing and task execution.
+Runtime coordinators for non-Python Dag file processing and task execution.
 
-Provides :class:`BaseCoordinator`, the base class for
-SDK-specific coordinators that bridge subprocess I/O between the
-Airflow supervisor and an external-SDK runtime (Java, Go, Rust, etc.),
-and :class:`CoordinatorManager`, the registry that loads coordinator
+Provides :class:`BaseCoordinator`, the base class for SDK-specific coordinators
+that run an external-SDK runtime (Java, Go, TypeScript, etc.) for the Airflow
+supervisor, and :class:`CoordinatorManager`, the registry that loads coordinator
 instances from the ``[sdk] coordinators`` configuration.
 
-The coordinator's :meth:`~BaseCoordinator.run_task_execution` handles the full
-lifecycle:
-
-1. Creates TCP servers for comm and logs channels, and a socketpair for stderr.
-2. Calls :meth:`~BaseCoordinator.task_execution_cmd` (provided by the subclass)
-   to obtain the subprocess command.
-3. Spawns the subprocess and accepts TCP connections from it.
-4. Runs a selector-based bridge that transparently forwards bytes
-   between fd 0 (supervisor) and the subprocess comm socket, and
-   re-emits the subprocess's log and stderr output through structlog.
+A coordinator executes a task through :meth:`~BaseCoordinator.execute_task`. A
+coordinator that also parses native Dags hands out a Dag importer through
+:meth:`~BaseCoordinator.get_dag_importer`, and :meth:`CoordinatorManager.for_bundle`
+selects the coordinators whose importers parse a Dag bundle.
 """
 
 from __future__ import annotations
@@ -60,6 +53,7 @@ if TYPE_CHECKING:
 
     from airflow.sdk.api.client import Client
     from airflow.sdk.api.datamodels._generated import TaskInstance
+    from airflow.sdk.importers import AbstractDagImporter
 
 __all__ = [
     "BaseCoordinator",
@@ -106,6 +100,18 @@ class BaseCoordinator:
         This should execute the task and return a result.
         """
         raise NotImplementedError
+
+    def get_dag_importer(self) -> AbstractDagImporter | None:
+        """
+        Return the Dag importer that parses this coordinator's native Dag files.
+
+        ``None``, the default, means the coordinator parses no native Dags.
+        """
+        return None
+
+    def serves_bundle(self, bundle_name: str) -> bool:
+        """Return whether this coordinator's Dag importer parses Dag files in *bundle_name*."""
+        return False
 
 
 class _CoordinatorSpec(pydantic.BaseModel):
@@ -293,6 +299,24 @@ class CoordinatorManager:
         log.debug("Coordinator found for queue", coordinator=coordinator, queue=queue)
         return coordinator
 
+    def for_bundle(self, bundle_name: str) -> dict[str, BaseCoordinator]:
+        """
+        Return the coordinators that parse Dag files in *bundle_name*, keyed by their config key.
+
+        Every configured coordinator is built to learn whether it serves the bundle, in config
+        order. One that cannot be built is logged and skipped.
+        """
+        coordinators: dict[str, BaseCoordinator] = {}
+        for key in self._coordinator_specs:
+            try:
+                coordinator = self._find_queue(key)
+            except Exception:
+                log.exception("Cannot load coordinator; skipping it for Dag parsing", coordinator=key)
+                continue
+            if coordinator.serves_bundle(bundle_name):
+                coordinators[key] = coordinator
+        return coordinators
+
     def extra_for_queue(self, queue: str) -> dict[str, Any] | None:
         """
         Return the optional ``extra`` mapping configured for *queue*'s coordinator.
@@ -315,5 +339,13 @@ def get_coordinator_manager() -> CoordinatorManager:
 
 
 def reset_coordinator_manager() -> None:
-    """Clear the cached :class:`CoordinatorManager` (test helper)."""
+    """
+    Clear the cached :class:`CoordinatorManager` (test helper).
+
+    The cached Dag importer registries hold importers bound to its coordinators, so they are
+    cleared too.
+    """
+    from airflow.sdk.importers.base import get_importer_registry
+
     get_coordinator_manager.cache_clear()
+    get_importer_registry.cache_clear()
