@@ -34,6 +34,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
 from airflow.exceptions import AirflowConfigException
+from airflow.sdk.coordinators._dag_importer import CoordinatorDagImporter
 from airflow.sdk.importers import (
     AbstractDagImporter,
     DagImporterRegistry,
@@ -52,6 +53,7 @@ if TYPE_CHECKING:
     from collections.abc import Iterator
 
     from airflow.dag_processing.bundles.base import BaseDagBundle
+    from airflow.sdk.coordinators._subprocess import SubprocessCoordinator
 
 log = logging.getLogger(__name__)
 
@@ -154,6 +156,20 @@ def _get_claiming_importer_or_none(
     except Exception as e:
         log.warning("Cannot load the Dag importer for %s: %s", path, e)
         return None
+
+
+def get_claiming_coordinator(
+    path: str | os.PathLike[str], bundle_name: str | None
+) -> SubprocessCoordinator | None:
+    """
+    Return the coordinator whose runtime parses ``path``, or ``None`` when a Python child parses it.
+
+    A runtime parses the file when the importer that claims it is a coordinator's Dag importer.
+    """
+    if (registry := get_task_sdk_registry(bundle_name)) is None:
+        return None
+    importer = _get_claiming_importer_or_none(registry, path)
+    return importer.coordinator if isinstance(importer, CoordinatorDagImporter) else None
 
 
 def _group_claiming_importers(

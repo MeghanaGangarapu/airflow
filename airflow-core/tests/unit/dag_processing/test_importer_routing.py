@@ -18,12 +18,18 @@
 from __future__ import annotations
 
 import logging
+from unittest import mock
 
 import pytest
 
-from airflow.dag_processing.importer_routing import _find_bundle_file, get_task_sdk_registry
+from airflow.dag_processing.importer_routing import (
+    _find_bundle_file,
+    get_claiming_coordinator,
+    get_task_sdk_registry,
+)
 
 from unit.dag_processing.fake_importers import FAKE_IMPORTER, task_sdk_importers, write_jar
+from unit.dag_processing.fake_lang_sdk import FakeCoordinator, fake_coordinator
 
 
 @pytest.mark.parametrize(
@@ -60,3 +66,17 @@ def test_legacy_extension_mapping_is_warned_once(caplog):
     assert warnings == [
         "Ignoring the Dag importer configured for .py files: they always use the legacy importer"
     ]
+
+
+def test_get_claiming_coordinator_returns_the_coordinator_of_its_importer(tmp_path):
+    with fake_coordinator(), task_sdk_importers(FAKE_IMPORTER):
+        coordinator = get_claiming_coordinator(tmp_path / "dags.native", "testing")
+        others = [get_claiming_coordinator(tmp_path / name, "testing") for name in ("dags.fake", "dag.py")]
+
+    assert isinstance(coordinator, FakeCoordinator)
+    assert others == [None, None]
+
+
+@mock.patch("airflow.dag_processing.importer_routing.get_task_sdk_registry", autospec=True, return_value=None)
+def test_get_claiming_coordinator_without_a_registry(mock_registry, tmp_path):
+    assert get_claiming_coordinator(tmp_path / "dags.native", "testing") is None

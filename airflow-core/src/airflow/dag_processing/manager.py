@@ -56,12 +56,17 @@ from airflow.dag_processing.bundles.base import (
 from airflow.dag_processing.bundles.manager import DagBundlesManager
 from airflow.dag_processing.collection import update_dag_parsing_results_in_db
 from airflow.dag_processing.importer_routing import (
+    get_claiming_coordinator,
     get_task_sdk_registry,
     has_claiming_importers,
     is_claimed,
     merge_claimed_paths,
 )
-from airflow.dag_processing.processor import DagFileParsingResult, DagFileProcessorProcess
+from airflow.dag_processing.processor import (
+    DagFileParsingResult,
+    DagFileProcessorProcess,
+    LangSDKDagFileProcessorProcess,
+)
 from airflow.models.asset import remove_references_to_deleted_dags
 from airflow.models.dag import DagModel
 from airflow.models.dagbag import DagPriorityParsingRequest
@@ -1459,6 +1464,29 @@ class DagFileProcessorManager(LoggingMixin):
 
         callback_to_execute_for_file = self._callback_to_execute.pop(dag_file, [])
         logger, logger_filehandle = self._get_logger_for_dag_file(dag_file)
+
+        if (
+            coordinator := get_claiming_coordinator(dag_file.absolute_path, dag_file.bundle_name)
+        ) is not None:
+            if callback_to_execute_for_file:
+                self.log.warning(
+                    "Dropping %d callbacks for %s: Lang-SDK runtimes do not run callbacks",
+                    len(callback_to_execute_for_file),
+                    dag_file.rel_path,
+                )
+            return LangSDKDagFileProcessorProcess.start(
+                id=id,
+                coordinator=coordinator,
+                path=dag_file.absolute_path,
+                bundle_path=cast("Path", dag_file.bundle_path),
+                bundle_name=dag_file.bundle_name,
+                dag_file_rel_path=str(dag_file.rel_path),
+                selector=self.selector,
+                logger=logger,
+                logger_filehandle=logger_filehandle,
+                subprocess_logs_to_stdout=conf.get("logging", "dag_processor_log_target") == "stdout",
+                client=self.client,
+            )
 
         return DagFileProcessorProcess.start(
             id=id,
