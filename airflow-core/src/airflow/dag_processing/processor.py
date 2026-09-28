@@ -30,11 +30,12 @@ import traceback
 from collections.abc import Callable, Sequence
 from pathlib import Path
 from socket import socket, socketpair
-from typing import TYPE_CHECKING, Annotated, Any, BinaryIO, ClassVar, Literal, NoReturn
+from typing import TYPE_CHECKING, Annotated, Any, BinaryIO, ClassVar, Literal, NoReturn, cast
 
 import attrs
 import psutil
 from pydantic import BaseModel, Field, TypeAdapter
+from uuid6 import uuid7
 
 from airflow._shared.observability.metrics import stats
 from airflow.callbacks.callback_requests import (
@@ -48,8 +49,8 @@ from airflow.dag_processing.bundles.base import BundleVersionLock
 from airflow.dag_processing.dagbag import BundleDagBag, DagBag
 from airflow.models.dag import DagModel
 from airflow.sdk.coordinators._subprocess import _is_connection_from_pid, _ResourceTracker, _start_server
-from airflow.sdk.exceptions import TaskNotFound
-from airflow.sdk.execution_time import supervisor
+from airflow.sdk.exceptions import AirflowRuntimeError, TaskNotFound
+from airflow.sdk.execution_time import supervisor, task_runner
 from airflow.sdk.execution_time.comms import (
     ConnectionResult,
     DeleteVariable,
@@ -801,6 +802,7 @@ class LangSDKDagFileProcessorProcess(DagFileProcessorProcess):
     """The runtime's comm connection, set once the runtime connects."""
 
     client: Client | None = None  # type: ignore[assignment]
+    """Answers the runtime's requests; without one they are relayed to ``SUPERVISOR_COMMS``."""
 
     logger_filehandle: BinaryIO | None = None  # type: ignore[assignment]
 
@@ -873,6 +875,52 @@ class LangSDKDagFileProcessorProcess(DagFileProcessorProcess):
             file=os.fspath(path), bundle_path=bundle_path, bundle_name=bundle_name
         )
         return proc
+
+    @classmethod
+    def run(
+        cls,
+        *,
+        coordinator: SubprocessCoordinator,
+        path: str | os.PathLike[str],
+        bundle_path: Path,
+        bundle_name: str,
+        dag_file_rel_path: str,
+        timeout: float | None,
+        logger: FilteringBoundLogger,
+    ) -> DagFileParsingResult:
+        """
+        Parse *path* outside the Dag processor and wait for the result.
+
+        The runtime's requests are relayed to the process this one runs in, such as a task.
+
+        :raises TimeoutError: if the parse does not finish within *timeout* seconds. The runtime is
+            killed.
+        """
+        with selectors.DefaultSelector() as selector:
+            proc = cls.start(
+                id=uuid7(),
+                coordinator=coordinator,
+                path=path,
+                bundle_path=bundle_path,
+                bundle_name=bundle_name,
+                dag_file_rel_path=dag_file_rel_path,
+                selector=selector,
+                logger=logger,
+            )
+            try:
+                while not proc.is_ready:
+                    wait = 0.1
+                    if timeout is not None:
+                        if (remaining := proc.start_time + timeout - time.monotonic()) <= 0:
+                            proc.kill(signal.SIGKILL)
+                            raise TimeoutError(
+                                f"The Lang-SDK runtime did not parse {os.fspath(path)} within {timeout}s"
+                            )
+                        wait = min(wait, remaining)
+                    proc._service_subprocess(max_wait_time=wait)
+            finally:
+                proc.close()
+        return cast("DagFileParsingResult", proc.parsing_result)
 
     @staticmethod
     def _run_child(
@@ -1033,6 +1081,36 @@ class LangSDKDagFileProcessorProcess(DagFileProcessorProcess):
             serialized_dags=[],
             import_errors={self.dag_file_rel_path: message},
         )
+
+    def _handle_request(self, msg, log: FilteringBoundLogger, req_id: int) -> None:
+        if self.client is None and not isinstance(msg, DagFileParsingResult):
+            self._relay_request(msg, log, req_id)
+            return
+        super()._handle_request(msg, log, req_id)
+
+    def _relay_request(self, msg: BaseModel, log: FilteringBoundLogger, req_id: int) -> None:
+        """Answer the runtime's request through ``SUPERVISOR_COMMS`` of the process this one runs in."""
+        if isinstance(msg, MaskSecret):
+            # This process forwards the runtime's logs, so it masks the secret as well.
+            self._request_handlers[MaskSecret](self, msg, log, req_id)
+        comms = getattr(task_runner, "SUPERVISOR_COMMS", None)
+        if comms is None:
+            self.send_msg(
+                None,
+                request_id=req_id,
+                error=ErrorResponse(
+                    detail={
+                        "message": f"{type(msg).__name__} is answered only in a task or the Dag processor"
+                    }
+                ),
+            )
+            return
+        try:
+            response = comms.send(msg)
+        except AirflowRuntimeError as e:
+            self.send_msg(None, request_id=req_id, error=e.error)
+            return
+        self.send_msg(response, request_id=req_id)
 
     def _handle_parsing_result(
         self, msg: DagFileParsingResult, log: FilteringBoundLogger, req_id: int

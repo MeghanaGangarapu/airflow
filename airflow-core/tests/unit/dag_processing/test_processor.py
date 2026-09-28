@@ -74,7 +74,8 @@ from airflow.models import DagRun
 from airflow.sdk import DAG, BaseOperator
 from airflow.sdk.api.client import Client
 from airflow.sdk.api.datamodels._generated import ConnectionResponse, DagRunState, VariableResponse
-from airflow.sdk.execution_time import comms, supervisor
+from airflow.sdk.exceptions import AirflowRuntimeError, ErrorType
+from airflow.sdk.execution_time import comms, supervisor, task_runner
 from airflow.sdk.execution_time.comms import (
     GetConnection,
     GetTaskStates,
@@ -86,6 +87,7 @@ from airflow.sdk.execution_time.comms import (
     TICount,
     ToSupervisor,
     ToTask,
+    VariableResult,
     XComResult,
     XComSequenceSliceResult,
 )
@@ -2797,3 +2799,66 @@ class TestLangSDKDagFileProcessorProcess:
         _service_until_ready(proc, selector)
 
         assert [dag.dag_id for dag in proc.parsing_result.serialized_dags] == ["native_dag"]
+
+
+class TestLangSDKDagFileProcessorProcessRun:
+    @staticmethod
+    def _run(tmp_path, *, timeout: float | None = 30, **spec) -> DagFileParsingResult:
+        return LangSDKDagFileProcessorProcess.run(
+            coordinator=FakeCoordinator(),
+            path=write_native_file(tmp_path / "dag.native", **spec),
+            bundle_path=tmp_path,
+            bundle_name="testing",
+            dag_file_rel_path="dag.native",
+            timeout=timeout,
+            logger=structlog.get_logger(),
+        )
+
+    @staticmethod
+    def _get_reply(result: DagFileParsingResult) -> dict:
+        [dag] = result.serialized_dags
+        return json.loads(dag.data["dag"]["description"])["reply"]
+
+    def test_returns_the_parse_result(self, tmp_path):
+        result = self._run(tmp_path, dags=["native_dag"], timeout=None)
+
+        assert [dag.dag_id for dag in result.serialized_dags] == ["native_dag"]
+
+    @patch.object(task_runner, "SUPERVISOR_COMMS", create=True)
+    def test_requests_are_relayed_to_the_supervisor(self, mock_comms, tmp_path):
+        mock_comms.send.return_value = VariableResult(key="native_var", value="relayed")
+
+        result = self._run(tmp_path, dags=["native_dag"], get_variable="native_var")
+
+        assert self._get_reply(result)["body"]["value"] == "relayed"
+        mock_comms.send.assert_called_once_with(GetVariable(key="native_var"))
+
+    @patch.object(task_runner, "SUPERVISOR_COMMS", create=True)
+    def test_a_relayed_error_reaches_the_runtime(self, mock_comms, tmp_path):
+        mock_comms.send.side_effect = AirflowRuntimeError(
+            comms.ErrorResponse(error=ErrorType.VARIABLE_NOT_FOUND, detail={"key": "native_var"})
+        )
+
+        result = self._run(tmp_path, dags=["native_dag"], get_variable="native_var")
+
+        assert self._get_reply(result)["error"]["error"] == "VARIABLE_NOT_FOUND"
+
+    def test_requests_without_a_supervisor_get_an_error(self, monkeypatch, tmp_path):
+        monkeypatch.delattr(task_runner, "SUPERVISOR_COMMS", raising=False)
+
+        result = self._run(tmp_path, dags=["native_dag"], get_variable="native_var")
+
+        assert self._get_reply(result)["error"]["detail"] == {
+            "message": "GetVariable is answered only in a task or the Dag processor"
+        }
+
+    @patch.object(
+        LangSDKDagFileProcessorProcess, "kill", autospec=True, side_effect=LangSDKDagFileProcessorProcess.kill
+    )
+    def test_a_parse_past_its_timeout_is_killed(self, mock_kill, tmp_path):
+        with pytest.raises(TimeoutError, match="did not parse .*dag.native within 1s"):
+            self._run(tmp_path, dags=["native_dag"], sleep=30, timeout=1)
+
+        [proc] = [c.args[0] for c in mock_kill.call_args_list]
+        mock_kill.assert_called_once_with(proc, signal.SIGKILL)
+        assert proc._exit_code == -signal.SIGKILL
