@@ -89,6 +89,7 @@ from tests_common.test_utils.db import (
     clear_db_serialized_dags,
     clear_db_teams,
 )
+from unit.dag_processing.fake_importers import FAKE_IMPORTER, JAR_IMPORTER, task_sdk_importers, write_jar
 from unit.models import TEST_DAGS_FOLDER
 
 pytestmark = pytest.mark.db_test
@@ -438,6 +439,46 @@ class TestDagFileProcessorManager:
             "test_zip.zip/valid_dag.py",
             "test_zip.zip/broken_dag.py",
         }
+
+    def test_find_files_in_bundle_queues_claimed_files(self, tmp_path):
+        (tmp_path / "python_dag.py").write_text("from airflow.sdk import DAG\n")
+        (tmp_path / "claimed.fake").write_text("claimed_dag\n")
+        write_jar(tmp_path / "native.jar", "native_dag")
+        write_jar(tmp_path / "library.jar")
+        bundle = MagicMock(spec=BaseDagBundle)
+        bundle.name = "testing"
+        bundle.path = tmp_path
+
+        with task_sdk_importers(FAKE_IMPORTER, JAR_IMPORTER):
+            found = DagFileProcessorManager(max_runs=1)._find_files_in_bundle(bundle)
+
+        assert sorted(found) == [Path("claimed.fake"), Path("native.jar"), Path("python_dag.py")]
+
+    def test_get_observed_filelocs_keeps_a_claimed_archive_whole(self, tmp_path):
+        write_jar(tmp_path / "native.jar", "native_dag")
+
+        with task_sdk_importers(JAR_IMPORTER):
+            observed_filelocs = DagFileProcessorManager(max_runs=1)._get_observed_filelocs(
+                {DagFileInfo(bundle_name="testing", rel_path=Path("native.jar"), bundle_path=tmp_path)}
+            )
+
+        assert observed_filelocs == {"native.jar"}
+
+    def test_unclaimed_jar_keeps_the_zip_handling(self, tmp_path):
+        write_jar(tmp_path / "native.jar", "native_dag")
+        bundle = MagicMock(spec=BaseDagBundle)
+        bundle.name = "testing"
+        bundle.path = tmp_path
+
+        with task_sdk_importers():
+            manager = DagFileProcessorManager(max_runs=1)
+            found = manager._find_files_in_bundle(bundle)
+            observed_filelocs = manager._get_observed_filelocs(
+                {DagFileInfo(bundle_name="testing", rel_path=Path("native.jar"), bundle_path=tmp_path)}
+            )
+
+        assert found == [Path("native.jar")]
+        assert observed_filelocs == {"native.jar/dag.py"}
 
     def test_sync_bundles_deactivates_missing_when_owning_all_bundles(self):
         """A processor with no bundle filter owns the full config and may deactivate missing bundles."""
