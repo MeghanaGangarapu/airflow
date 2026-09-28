@@ -32,6 +32,8 @@ do, and never imports Airflow. The ``.native`` file is JSON; its keys choose wha
 * ``pid_file``: a file to write the runtime's pid to.
 * ``raw_frames``: hex-encoded bytes to send on comm before replying.
 * ``ignore_sigterm``: ignore SIGTERM.
+* ``second_result``: the Dag ids of a second result to send after the first; the reply to it is
+  written to ``second_reply_file``.
 * ``grandchild_holds``: after replying, exit and leave a grandchild holding the sockets for this many
   seconds; its pid is written to ``grandchild_pid_file``.
 """
@@ -166,25 +168,30 @@ def main() -> None:
         reply = {"body": body, "error": error}
     description = json.dumps({"request": request, "reply": reply})
 
+    payload_args = {
+        "fileloc": request["file"],
+        "bundle_path": request["bundle_path"],
+        "description": description,
+        "invalid": spec.get("invalid", False),
+        "cyclic": spec.get("cyclic", False),
+    }
     result = {
         "type": "DagFileParsingResult",
         "fileloc": request["file"],
-        "serialized_dags": [
-            {
-                "data": _build_payload(
-                    dag_id,
-                    fileloc=request["file"],
-                    bundle_path=request["bundle_path"],
-                    description=description,
-                    invalid=spec.get("invalid", False),
-                    cyclic=spec.get("cyclic", False),
-                )
-            }
-            for dag_id in spec.get("dags", [])
-        ],
+        "serialized_dags": [{"data": _build_payload(d, **payload_args)} for d in spec.get("dags", [])],
         "import_errors": spec.get("import_errors"),
     }
     _send_frame(comm, [request_id, result])
+    if second_dags := spec.get("second_result"):
+        second = {
+            **result,
+            "serialized_dags": [{"data": _build_payload(d, **payload_args)} for d in second_dags],
+        }
+        _send_frame(comm, [request_id, second])
+        _receive_frame(comm)
+        _, _, error = _receive_frame(comm)
+        Path(spec["second_reply_file"]).write_text(json.dumps(error))
+        return
     if seconds := spec.get("grandchild_holds"):
         # A grandchild keeps comm, logs and stdout open after the runtime exits.
         if (grandchild := os.fork()) == 0:

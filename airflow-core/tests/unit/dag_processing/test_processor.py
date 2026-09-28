@@ -2774,6 +2774,17 @@ class TestLangSDKDagFileProcessorProcess:
         assert error in message
         assert proc._exit_code == -signal.SIGKILL
 
+    def test_a_second_result_is_rejected(self, start, selector, tmp_path):
+        reply_file = tmp_path / "second_reply.json"
+        proc = start(dags=["first_dag"], second_result=["second_dag"], second_reply_file=str(reply_file))
+
+        _service_until_ready(proc, selector)
+
+        assert [dag.dag_id for dag in proc.parsing_result.serialized_dags] == ["first_dag"]
+        assert json.loads(reply_file.read_text())["detail"] == {
+            "message": "A parse result was already received"
+        }
+
     def test_runtime_import_errors_are_kept(self, start, selector):
         proc = start(dags=[], import_errors={"dag.native": "native Dag failed"})
 

@@ -84,6 +84,7 @@ from airflow.sdk.execution_time.comms import (
 )
 from airflow.sdk.execution_time.supervisor import (
     PsutilTracker,
+    ResponseSent,
     WatchedSubprocess,
     length_prefixed_frame_reader,
     make_buffered_socket_reader,
@@ -1158,9 +1159,17 @@ class LangSDKDagFileProcessorProcess(DagFileProcessorProcess):
             return
         self.send_msg(response, request_id=req_id)
 
-    def _handle_parsing_result(
+    def _handle_parsing_result(  # type: ignore[override]
         self, msg: DagFileParsingResult, log: FilteringBoundLogger, req_id: int
-    ) -> RequestResult:
+    ) -> RequestResult | ResponseSent:
+        if self.parsing_result is not None:
+            log.warning("Ignoring another parse result from the Lang-SDK runtime", fileloc=msg.fileloc)
+            self.send_msg(
+                None,
+                request_id=req_id,
+                error=ErrorResponse(detail={"message": "A parse result was already received"}),
+            )
+            return ResponseSent.ALREADY_SENT
         import_errors = dict(msg.import_errors or {})
         serialized_dags = []
         for dag in msg.serialized_dags:
