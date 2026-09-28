@@ -1,0 +1,122 @@
+#
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+from __future__ import annotations
+
+import pathlib
+from types import SimpleNamespace
+
+import pytest
+from task_sdk.coordinators.node._bundle_test_utils import (
+    BUNDLE_NAME,
+    LAYOUT_PREFIX,
+    mutate_byte,
+    read_layout,
+    write_bundle,
+)
+
+from airflow.sdk.coordinators.node._bundle_reader import _digest_cache
+from airflow.sdk.coordinators.node._dag_importer import NodeDagImporter
+from airflow.sdk.coordinators.node.coordinator import NodeCoordinator
+from airflow.sdk.importers import DagSourceCode, FilesystemDagDefinition
+
+
+@pytest.fixture(autouse=True)
+def clear_digest_cache():
+    _digest_cache.clear()
+
+
+@pytest.fixture
+def importer() -> NodeDagImporter:
+    return NodeDagImporter(coordinator=NodeCoordinator())
+
+
+def _mutate_section(bundle: pathlib.Path, section: str) -> None:
+    mutate_byte(bundle, int(read_layout(bundle)[section]["start"], 16))  # type: ignore[index, call-overload]
+
+
+def test_lists_only_packed_bundles(importer, tmp_path):
+    nested = write_bundle(tmp_path / "team", "sales")
+    tampered = write_bundle(tmp_path, "inventory", name="tampered.min.mjs")
+    _mutate_section(tampered, "code")
+    write_bundle(tmp_path, "orders", name="plain.mjs")
+    (tmp_path / "vendor.min.mjs").write_bytes(b"export {};\n")
+
+    definitions = importer.list_dag_definitions(SimpleNamespace(name="dags-folder", path=tmp_path))
+
+    # A tampered bundle keeps its header, so parsing it reports the integrity failure.
+    assert sorted(d.path for d in definitions) == sorted([nested, tampered])
+
+
+class TestMightContainDag:
+    @pytest.mark.parametrize("safe_mode", [True, False])
+    @pytest.mark.parametrize(
+        ("content", "expected"),
+        [
+            (None, True),
+            (b"export {};\n", False),
+            (b"", False),
+            (LAYOUT_PREFIX[:-1], False),
+        ],
+        ids=["bundle", "plain-module", "empty", "truncated-prefix"],
+    )
+    def test_checks_the_layout_header(self, importer, tmp_path, content, expected, safe_mode):
+        path = write_bundle(tmp_path, "sales")
+        if content is not None:
+            path.write_bytes(content)
+
+        assert importer.might_contain_dag(FilesystemDagDefinition(path), safe_mode) is expected
+
+    def test_keeps_an_unreadable_file(self, importer, tmp_path, monkeypatch):
+        path = write_bundle(tmp_path, "sales")
+        original_open = pathlib.Path.open
+
+        def raise_permission_error(self, *args, **kwargs):
+            if self.name == BUNDLE_NAME:
+                raise PermissionError("denied")
+            return original_open(self, *args, **kwargs)
+
+        monkeypatch.setattr(pathlib.Path, "open", raise_permission_error)
+
+        assert importer.might_contain_dag(FilesystemDagDefinition(path), True) is True
+
+
+class TestGetSourceCode:
+    def test_returns_the_entry_module(self, importer, tmp_path):
+        source = 'import { Bundle } from "apache-airflow-ts-sdk";\n/* the */ await new Bundle().serve();\n'
+        path = write_bundle(tmp_path, "sales", source=source.encode())
+
+        assert importer.get_source_code(FilesystemDagDefinition(path)) == DagSourceCode(source, "typescript")
+
+    @pytest.mark.parametrize(
+        ("break_bundle", "reason"),
+        [
+            (lambda path: _mutate_section(path, "source"), "source SHA-256 mismatch"),
+            (lambda path: write_bundle(path.parent, "sales", source=b"x" * (1024 * 1024 + 1)), "exceeds"),
+            (lambda path: path.unlink(), "cannot read bundle.min.mjs"),
+        ],
+        ids=["tampered", "oversize", "missing"],
+    )
+    def test_returns_a_notice_when_the_source_cannot_be_read(self, importer, tmp_path, break_bundle, reason):
+        path = write_bundle(tmp_path, "sales")
+        break_bundle(path)
+
+        source_code = importer.get_source_code(FilesystemDagDefinition(path))
+
+        assert source_code.language == "typescript"
+        assert source_code.source_code.startswith("// Source code is not available: ")
+        assert reason in source_code.source_code

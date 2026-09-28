@@ -39,6 +39,8 @@ from airflow.sdk.coordinators._bundle_metadata import extract_supervisor_schema_
 if TYPE_CHECKING:
     from typing import BinaryIO
 
+BUNDLE_SUFFIX = ".min.mjs"
+
 # Format prefixes and whole-line limits must agree with the TypeScript encoder.
 _LAYOUT_COMMENT_PREFIX = b"//# airflowBundle="
 _MAX_LAYOUT_LINE_BYTES = 4096
@@ -122,6 +124,12 @@ def read_bundle(bundle_path: pathlib.Path) -> BundleMetadata:
 def read_bundle_source(bundle_path: pathlib.Path) -> str:
     """Return the entrypoint source ``airflow-ts-pack`` embedded in *bundle_path*."""
     return _decode_source(_read_verified_payloads(bundle_path).source)
+
+
+def has_bundle_layout_prefix(bundle_path: pathlib.Path) -> bool:
+    """Return whether *bundle_path* starts with the layout comment ``airflow-ts-pack`` writes."""
+    with bundle_path.open("rb") as bundle_file:
+        return bundle_file.read(len(_LAYOUT_COMMENT_PREFIX)) == _LAYOUT_COMMENT_PREFIX
 
 
 @attrs.define(frozen=True)
