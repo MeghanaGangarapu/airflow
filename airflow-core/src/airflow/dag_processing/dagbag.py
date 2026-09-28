@@ -32,6 +32,15 @@ from tabulate import tabulate
 from airflow import settings
 from airflow._shared.timezones import timezone
 from airflow.configuration import conf
+from airflow.dag_processing.importer_routing import (
+    BundleRef,
+    claimed_importer,
+    get_task_sdk_registry,
+    has_claiming_importers,
+    is_claimed,
+    iter_claimed_paths,
+    iter_claimed_results,
+)
 from airflow.dag_processing.importers import get_importer_registry
 from airflow.exceptions import (
     AirflowClusterPolicyError,
@@ -55,6 +64,7 @@ if TYPE_CHECKING:
 
     from airflow import DAG
     from airflow.models.dagwarning import DagWarning
+    from airflow.sdk.importers import AbstractDagImporter, DagImportWarning
 
 
 @contextlib.contextmanager
@@ -314,6 +324,19 @@ class DagBag(LoggingMixin):
 
         self.captured_warnings.pop(filepath, None)
 
+        if (task_sdk_registry := get_task_sdk_registry(self.bundle_name)) is not None:
+            try:
+                task_sdk_importer = claimed_importer(task_sdk_registry, filepath)
+            except Exception as e:
+                self.log.exception("Cannot load the Dag importer for %s", filepath)
+                self.import_errors[self._get_error_key(filepath)] = f"{type(e).__name__}: {e}"
+                self.file_last_changed[filepath] = file_last_changed_on_disk
+                return []
+            if task_sdk_importer is not None:
+                found_dags = self._process_claimed_file(filepath, task_sdk_importer, safe_mode)
+                self.file_last_changed[filepath] = file_last_changed_on_disk
+                return found_dags
+
         registry = get_importer_registry()
         importer = registry.get_importer(filepath)
 
@@ -357,8 +380,58 @@ class DagBag(LoggingMixin):
                     lineno=w.line_number or 0,
                 )
 
+        bagged_dags = self._bag_dags(filepath, result.dags)
+
+        self.file_last_changed[filepath] = file_last_changed_on_disk
+        return bagged_dags
+
+    def _process_claimed_file(
+        self, filepath: str, importer: AbstractDagImporter[Any], safe_mode: bool
+    ) -> list[DAG]:
+        """Import a file that a Task SDK importer claims and bag its Dags."""
+        dags: list[DAG] = []
+        errors: dict[str, list[str]] = {}
+        import_warnings: list[DagImportWarning] = []
+        for result in iter_claimed_results(
+            importer,
+            filepath,
+            bundle_name=self.bundle_name,
+            bundle_path=self.bundle_path,
+            safe_mode=safe_mode,
+        ):
+            if result.skipped_definitions and not self.has_logged:
+                self.has_logged = True
+                self.log.info("File %s assumed to contain no DAGs. Skipping.", filepath)
+            for error in result.errors:
+                errors.setdefault(self._get_error_key(error.source_reference), []).append(
+                    error.stacktrace or error.message
+                )
+                self.log.error("Error loading DAG from %s: %s", error.source_reference, error.message)
+            import_warnings.extend(result.warnings)
+            dags.extend(result.dags)
+
+        for error_key, messages in errors.items():
+            self.import_errors[error_key] = "\n".join(messages)
+
+        if import_warnings:
+            self.captured_warnings[filepath] = tuple(
+                f"{w.source_reference}:{w.line_number}: {w.warning_type}: {w.message}"
+                for w in import_warnings
+            )
+            for w in import_warnings:
+                warnings.warn_explicit(
+                    message=w.message,
+                    category=UserWarning,
+                    filename=w.source_reference,
+                    lineno=w.line_number or 0,
+                )
+
+        return self._bag_dags(filepath, dags)
+
+    def _bag_dags(self, filepath: str, dags: list[DAG]) -> list[DAG]:
+        """Validate and bag the Dags imported from ``filepath``; a failure becomes an import error."""
         bagged_dags = []
-        for dag in result.dags:
+        for dag in dags:
             try:
                 if dag.fileloc is None:
                     dag.fileloc = filepath
@@ -378,8 +451,6 @@ class DagBag(LoggingMixin):
                 self.log.exception("Error bagging DAG from %s", filepath)
                 relative_path = self._get_relative_fileloc(filepath)
                 self.import_errors[relative_path] = f"{type(e).__name__}: {e}"
-
-        self.file_last_changed[filepath] = file_last_changed_on_disk
         return bagged_dags
 
     @property
@@ -421,6 +492,13 @@ class DagBag(LoggingMixin):
         if self.bundle_path:
             return str(Path(filepath).relative_to(self.bundle_path))
         return filepath
+
+    def _get_error_key(self, source_reference: str) -> str:
+        """Key an import error by its path relative to the bundle, or as is when outside it."""
+        if self.bundle_path:
+            with contextlib.suppress(ValueError):
+                return str(Path(source_reference).relative_to(self.bundle_path))
+        return source_reference
 
     def bag_dag(self, dag: DAG):
         """
@@ -496,7 +574,9 @@ class DagBag(LoggingMixin):
         dag_folder = correct_maybe_zipped(str(dag_folder))
 
         registry = get_importer_registry()
-        files_to_parse = registry.list_dag_files(dag_folder, safe_mode=safe_mode)
+        files_to_parse = self._add_claimed_files(
+            dag_folder, registry.list_dag_files(dag_folder, safe_mode=safe_mode), safe_mode
+        )
 
         for filepath in files_to_parse:
             try:
@@ -525,6 +605,24 @@ class DagBag(LoggingMixin):
                 self.log.exception(e)
 
         self.dagbag_stats = sorted(stats, key=lambda x: x.duration, reverse=True)
+
+    def _add_claimed_files(
+        self, dag_folder: str | Path, legacy_files: list[str], safe_mode: bool
+    ) -> list[str]:
+        """Swap the files that a Task SDK importer claims into the legacy file list."""
+        task_sdk_registry = get_task_sdk_registry(self.bundle_name)
+        if task_sdk_registry is None:
+            return legacy_files
+        if os.path.isfile(dag_folder):
+            return [os.fspath(dag_folder)] if is_claimed(task_sdk_registry, dag_folder) else legacy_files
+        if not has_claiming_importers(task_sdk_registry):
+            return legacy_files
+        claimed_paths = iter_claimed_paths(
+            task_sdk_registry, BundleRef(name=self.bundle_name, path=Path(dag_folder)), safe_mode=safe_mode
+        )
+        return [path for path in legacy_files if not is_claimed(task_sdk_registry, path)] + [
+            str(path) for path in claimed_paths
+        ]
 
     def dagbag_report(self):
         """Print a report around DagBag loading stats."""

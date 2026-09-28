@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import contextlib
 import inspect
+import json
 import logging
 import os
 import pathlib
@@ -49,11 +50,13 @@ from airflow.models.dagwarning import DagWarning, DagWarningType
 from airflow.models.pool import Pool
 from airflow.models.serialized_dag import SerializedDagModel
 from airflow.sdk import DAG, BaseOperator
+from airflow.sdk.importers import PythonDagImporter as TaskSdkPythonDagImporter, ZipImporter
 
 from tests_common.pytest_plugin import AIRFLOW_ROOT_PATH
 from tests_common.test_utils import db
 from tests_common.test_utils.config import conf_vars
 from unit import cluster_policies
+from unit.dag_processing.fake_importers import FAKE_IMPORTER, task_sdk_importers
 from unit.models import TEST_DAGS_FOLDER
 
 pytestmark = pytest.mark.db_test
@@ -1465,3 +1468,124 @@ class TestBundlePathSysPath:
 
         assert str(tmp_path) not in dag.description
         assert sys.path == syspath_before
+
+
+PY_DAG_SOURCE = """\
+from airflow.sdk import DAG
+from airflow.sdk.bases.operator import BaseOperator
+
+with DAG("{dag_id}", schedule=None):
+    BaseOperator(task_id="task")
+"""
+
+
+class TestClaimedFiles:
+    """Files that a Task SDK importer claims are parsed through it; everything else stays on legacy."""
+
+    def test_claimed_file_is_parsed(self, tmp_path):
+        claimed = tmp_path / "sub" / "dags.fake"
+        claimed.parent.mkdir()
+        claimed.write_text("claimed_a\nclaimed_b\nwarn: careful\n")
+
+        with task_sdk_importers(FAKE_IMPORTER), pytest.warns(UserWarning, match="careful"):
+            dagbag = DagBag(dag_folder=os.fspath(claimed), bundle_path=tmp_path, bundle_name="testing")
+
+        assert sorted(dagbag.dag_ids) == ["claimed_a", "claimed_b"]
+        dag = dagbag.dags["claimed_a"]
+        assert dag.fileloc == os.fspath(claimed)
+        assert dag.relative_fileloc == "sub/dags.fake"
+        assert dag.bundle_name == "testing"
+        assert dagbag.import_errors == {}
+        assert dagbag.captured_warnings == {os.fspath(claimed): (f"{claimed}:3: import: careful",)}
+
+    def test_claimed_file_errors_are_joined_under_the_relative_path(self, tmp_path):
+        claimed = tmp_path / "sub" / "broken.fake"
+        claimed.parent.mkdir()
+        claimed.write_text("error: first\nerror: second\n")
+
+        with task_sdk_importers({"classpath": FAKE_IMPORTER, "extensions": [".fake"]}):
+            dagbag = DagBag(dag_folder=os.fspath(claimed), bundle_path=tmp_path, bundle_name="testing")
+
+        assert dagbag.dags == {}
+        assert dagbag.import_errors == {"sub/broken.fake": "first\nsecond"}
+
+    def test_folder_collect_includes_claimed_files(self, tmp_path):
+        (tmp_path / "claimed.fake").write_text("claimed_dag\n")
+        (tmp_path / "python_dag.py").write_text(PY_DAG_SOURCE.format(dag_id="python_dag"))
+        (tmp_path / "notes.txt").write_text("airflow dag\n")
+
+        with task_sdk_importers(FAKE_IMPORTER):
+            dagbag = DagBag(dag_folder=os.fspath(tmp_path), bundle_path=tmp_path, bundle_name="testing")
+
+        assert sorted(dagbag.dag_ids) == ["claimed_dag", "python_dag"]
+        assert sorted(stat.file for stat in dagbag.dagbag_stats) == ["claimed.fake", "python_dag.py"]
+        assert dagbag.import_errors == {}
+
+    def test_python_and_zip_files_stay_on_the_legacy_importer(self, tmp_path):
+        (tmp_path / "claimed.fake").write_text("claimed_dag\n")
+        (tmp_path / "python_dag.py").write_text(PY_DAG_SOURCE.format(dag_id="python_dag"))
+        with zipfile.ZipFile(tmp_path / "packaged.zip", "w") as zf:
+            zf.writestr("zipped_dag.py", PY_DAG_SOURCE.format(dag_id="zipped_dag"))
+
+        with (
+            task_sdk_importers(FAKE_IMPORTER),
+            mock.patch.object(TaskSdkPythonDagImporter, "import_definition") as python_import,
+            mock.patch.object(ZipImporter, "import_definition") as zip_import,
+        ):
+            dagbag = DagBag(dag_folder=os.fspath(tmp_path), bundle_path=tmp_path, bundle_name="testing")
+
+        assert sorted(dagbag.dag_ids) == ["claimed_dag", "python_dag", "zipped_dag"]
+        python_import.assert_not_called()
+        zip_import.assert_not_called()
+
+    def test_invalid_importer_config_keeps_the_legacy_importer(self, tmp_path):
+        (tmp_path / "claimed.fake").write_text("claimed_dag\n")
+        (tmp_path / "python_dag.py").write_text(PY_DAG_SOURCE.format(dag_id="python_dag"))
+
+        with (
+            task_sdk_importers(),
+            conf_vars({("dag_processor", "dag_importer_configs"): '{"not": "a list"}'}),
+        ):
+            dagbag = DagBag(dag_folder=os.fspath(tmp_path), bundle_path=tmp_path, bundle_name="testing")
+
+        assert dagbag.dag_ids == ["python_dag"]
+        assert dagbag.import_errors == {}
+
+    def test_importer_that_cannot_load_is_an_import_error(self, tmp_path):
+        dag_file = tmp_path / "python_dag.py"
+        dag_file.write_text(PY_DAG_SOURCE.format(dag_id="python_dag"))
+
+        with task_sdk_importers({"classpath": "unit.dag_processing.missing.Importer", "extensions": [".py"]}):
+            dagbag = DagBag(dag_folder=os.fspath(dag_file), bundle_path=tmp_path, bundle_name="testing")
+
+        assert dagbag.dags == {}
+        assert list(dagbag.import_errors) == ["python_dag.py"]
+        assert (
+            "Failed to load DAG importer 'unit.dag_processing.missing.Importer'"
+            in (dagbag.import_errors["python_dag.py"])
+        )
+
+    def test_single_claimed_file_uses_the_bundle_importers(self, tmp_path):
+        claimed = tmp_path / "claimed.fake"
+        claimed.write_text("claimed_dag\n")
+        bundle_config = [
+            {
+                "name": "claiming",
+                "classpath": "airflow.dag_processing.bundles.local.LocalDagBundle",
+                "kwargs": {"path": os.fspath(tmp_path)},
+                "importers": [FAKE_IMPORTER],
+            }
+        ]
+
+        with (
+            task_sdk_importers(),
+            conf_vars({("dag_processor", "dag_bundle_config_list"): json.dumps(bundle_config)}),
+        ):
+            claiming = BundleDagBag(
+                dag_folder=os.fspath(claimed), bundle_path=tmp_path, bundle_name="claiming"
+            )
+            other = BundleDagBag(dag_folder=os.fspath(claimed), bundle_path=tmp_path, bundle_name="other")
+
+        assert claiming.dag_ids == ["claimed_dag"]
+        assert claiming.dags["claimed_dag"].relative_fileloc == "claimed.fake"
+        assert other.dag_ids == []

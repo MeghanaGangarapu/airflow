@@ -187,6 +187,15 @@ from airflow.sdk.execution_time.task_runner import (
     startup,
 )
 from airflow.sdk.execution_time.xcom import XCom
+from airflow.sdk.importers import (
+    AbstractDagImporter,
+    DagImportResult,
+    DagSourceCode,
+    FilesystemDagDefinition,
+    find_file_dag_definitions,
+    get_file_suffix,
+    reset_importer_registry,
+)
 from airflow.sdk.serde import deserialize
 from airflow.triggers.base import BaseEventTrigger, BaseTrigger, TriggerEvent
 from airflow.triggers.callback import CallbackTrigger
@@ -834,6 +843,72 @@ def test_parse_module_in_bundle_root(tmp_path: Path, make_ti_context):
         ti = parse(what, mock.Mock())
 
     assert ti.task.dag.dag_id == "dag_name"
+
+
+class DagListImporter(AbstractDagImporter[FilesystemDagDefinition]):
+    """Import ``.dags`` files that hold one Dag id per line, each with a task ``a``."""
+
+    supported_extensions = [".dags"]
+
+    def can_handle(self, definition):
+        return get_file_suffix(definition) in self.supported_extensions
+
+    def list_dag_definitions(self, bundle, *, safe_mode=True):
+        yield from find_file_dag_definitions(bundle.path, self.supported_extensions)
+
+    def import_definition(self, definition, bundle):
+        result = DagImportResult(definition=definition)
+        for dag_id in definition.read_text().split():
+            with DAG(dag_id, schedule=None) as dag:
+                BaseOperator(task_id="a")
+            dag.fileloc = repr(definition)
+            dag.relative_fileloc = definition.get_relative_loc(bundle.path)
+            result.dags.append(dag)
+        return result
+
+    def get_source_code(self, definition):
+        return DagSourceCode(source_code=definition.read_text(), language="text")
+
+
+def test_parse_dag_from_bundle_importer(tmp_path: Path, make_ti_context):
+    """A Dag file that a bundle's own importer claims is parsed through that importer."""
+    tmp_path.joinpath("listed.dags").write_text("listed_dag\n")
+    what = StartupDetails(
+        ti=TaskInstance(
+            id=uuid7(),
+            task_id="a",
+            dag_id="listed_dag",
+            run_id="c",
+            try_number=1,
+            dag_version_id=uuid7(),
+            queue="default",
+        ),
+        dag_rel_path="listed.dags",
+        bundle_info=BundleInfo(name="my-bundle", version=None),
+        ti_context=make_ti_context(),
+        start_date=timezone.utcnow(),
+        sentry_integration="",
+    )
+    bundle_config = [
+        {
+            "name": "my-bundle",
+            "classpath": "airflow.dag_processing.bundles.local.LocalDagBundle",
+            "kwargs": {"path": str(tmp_path), "refresh_interval": 1},
+            "importers": [f"{__name__}.DagListImporter"],
+        }
+    ]
+
+    reset_importer_registry()
+    try:
+        with patch.dict(
+            os.environ, {"AIRFLOW__DAG_PROCESSOR__DAG_BUNDLE_CONFIG_LIST": json.dumps(bundle_config)}
+        ):
+            ti = parse(what, mock.Mock())
+    finally:
+        reset_importer_registry()
+
+    assert ti.task.dag.dag_id == "listed_dag"
+    assert ti.task.dag.relative_fileloc == "listed.dags"
 
 
 @pytest.mark.parametrize("use_queues", [False, True])
