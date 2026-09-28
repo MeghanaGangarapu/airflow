@@ -63,6 +63,7 @@ from unit.dag_processing.fake_importers import (
     task_sdk_importers,
     write_jar,
 )
+from unit.dag_processing.fake_lang_sdk import fake_coordinator, write_native_file
 from unit.models import TEST_DAGS_FOLDER
 
 pytestmark = pytest.mark.db_test
@@ -1654,3 +1655,59 @@ class TestClaimedFiles:
         assert claiming.dag_ids == ["claimed_dag"]
         assert claiming.dags["claimed_dag"].relative_fileloc == "claimed.fake"
         assert other.dag_ids == []
+
+
+class TestCoordinatorParsedFiles:
+    """A file claimed by a coordinator's Dag importer is parsed by its runtime and rebuilt as SDK Dags."""
+
+    def test_native_file_is_bagged_as_sdk_dags(self, tmp_path):
+        (tmp_path / "sub").mkdir()
+        native = write_native_file(tmp_path / "sub" / "dags.native", dags=["native_a", "native_b"])
+
+        with fake_coordinator():
+            dagbag = DagBag(dag_folder=os.fspath(tmp_path), bundle_path=tmp_path, bundle_name="testing")
+
+        assert dagbag.import_errors == {}
+        assert sorted(dagbag.dag_ids) == ["native_a", "native_b"]
+        dag = dagbag.dags["native_a"]
+        assert isinstance(dag, DAG)
+        assert type(dag.task_dict["extract"]).__name__ == "_StubOperator"
+        assert (dag.fileloc, dag.relative_fileloc) == (os.fspath(native), "sub/dags.native")
+
+    @pytest.mark.parametrize(
+        ("spec", "message"),
+        [
+            pytest.param(
+                {"exit_before_connect": 3},
+                "The Lang-SDK runtime exited with code 3 without a parse result",
+                id="no-result",
+            ),
+            pytest.param(
+                {"schema_version": "1999-01-01"},
+                "Cannot start the Lang-SDK runtime: "
+                "ValueError: Version '1999-01-01' not found in supervisor schema bundle",
+                id="cannot-start",
+            ),
+            pytest.param({"import_errors": {"main.ts": "boom"}}, "main.ts: boom", id="runtime-error"),
+        ],
+    )
+    def test_runtime_failures_are_import_errors(self, tmp_path, spec, message):
+        native = write_native_file(tmp_path / "dags.native", **spec)
+
+        with fake_coordinator():
+            dagbag = DagBag(dag_folder=os.fspath(native), bundle_path=tmp_path, bundle_name="testing")
+
+        assert dagbag.dags == {}
+        assert dagbag.import_errors == {"dags.native": message}
+
+    @patch("airflow.settings.get_dagbag_import_timeout", autospec=True, return_value=1)
+    def test_a_parse_past_the_import_timeout_is_an_import_error(self, mock_timeout, tmp_path):
+        native = write_native_file(tmp_path / "dags.native", dags=["native_a"], sleep=30)
+
+        with fake_coordinator():
+            dagbag = DagBag(dag_folder=os.fspath(native), bundle_path=tmp_path, bundle_name="testing")
+
+        assert dagbag.dags == {}
+        assert dagbag.import_errors == {
+            "dags.native": f"The Lang-SDK runtime did not parse {native} within 1s"
+        }

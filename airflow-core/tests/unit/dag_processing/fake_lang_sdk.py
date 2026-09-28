@@ -19,15 +19,23 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import sys
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import attrs
 
+from airflow.sdk.coordinators._dag_importer import CoordinatorDagImporter
 from airflow.sdk.coordinators._subprocess import SubprocessCoordinator
+from airflow.sdk.importers import DagSourceCode, reset_importer_registry
+
+from tests_common.test_utils.config import conf_vars
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator
 
 FAKE_RUNTIME = Path(__file__).with_name("fake_lang_sdk_runtime.py")
 # The oldest supervisor schema version, so requests to the runtime are downgraded.
@@ -49,6 +57,28 @@ class FakeCoordinator(SubprocessCoordinator):
         return [sys.executable, os.fspath(FAKE_RUNTIME), os.fspath(path)], spec.get(
             "schema_version", SCHEMA_VERSION
         )
+
+    def get_dag_importer(self) -> FakeCoordinatorDagImporter:
+        return FakeCoordinatorDagImporter(coordinator=self)
+
+
+class FakeCoordinatorDagImporter(CoordinatorDagImporter):
+    artifact_suffix = ".native"
+
+    def get_source_code(self, definition) -> DagSourceCode:
+        return DagSourceCode(definition.read_text(), "fake")
+
+
+@contextlib.contextmanager
+def fake_coordinator(**kwargs: Any) -> Iterator[None]:
+    """Configure a ``FakeCoordinator``, with fresh coordinators and registries inside and after the block."""
+    spec = {"fake": {"classpath": f"{__name__}.FakeCoordinator", "kwargs": kwargs}}
+    reset_importer_registry()
+    try:
+        with conf_vars({("sdk", "coordinators"): json.dumps(spec)}):
+            yield
+    finally:
+        reset_importer_registry()
 
 
 def write_native_file(path: Path, **spec: Any) -> Path:
