@@ -22,6 +22,7 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import shlex
 import sys
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -47,16 +48,19 @@ class FakeCoordinator(SubprocessCoordinator):
     """
     Parse ``.native`` files with the fake runtime.
 
-    The file names the command's schema version, or a ``command_error`` to raise instead.
+    The file names the command's schema version, or a ``command_error`` to raise instead. With
+    ``launcher``, a shell starts the runtime as its child.
     """
 
     def _build_parse_dag_command(self, *, path: Path) -> tuple[list[str], str | None]:
         spec = json.loads(path.read_text())
         if error := spec.get("command_error"):
             raise FileNotFoundError(error)
-        return [sys.executable, os.fspath(FAKE_RUNTIME), os.fspath(path)], spec.get(
-            "schema_version", SCHEMA_VERSION
-        )
+        command = [sys.executable, os.fspath(FAKE_RUNTIME), os.fspath(path)]
+        if spec.get("launcher"):
+            # A shell that starts the runtime as its child and waits for it.
+            command = ["/bin/sh", "-c", f'{shlex.join(command)} "$@" & wait', "fake-launcher"]
+        return command, spec.get("schema_version", SCHEMA_VERSION)
 
     def get_dag_importer(self) -> FakeCoordinatorDagImporter:
         return FakeCoordinatorDagImporter(coordinator=self)

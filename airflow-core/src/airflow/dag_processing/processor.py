@@ -1162,6 +1162,15 @@ class LangSDKDagFileProcessorProcess(DagFileProcessorProcess):
             conn.close()
         self._unverified_connections = []
 
+    def _signal_subprocess(self, sig: signal.Signals) -> None:
+        # The command may be a launcher that starts the runtime which connects back, so the
+        # runtime's whole process tree is signalled, descendants first.
+        with contextlib.suppress(psutil.Error):
+            for descendant in psutil.Process(self.pid).children(recursive=True):
+                with contextlib.suppress(psutil.Error):
+                    descendant.send_signal(sig)
+        super()._signal_subprocess(sig)
+
     def _kill_runtime(self) -> None:
         """Kill the runtime and wait for it, without servicing its sockets, whose handler may have failed."""
         if self._exit_code is not None:

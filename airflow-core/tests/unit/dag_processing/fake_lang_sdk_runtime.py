@@ -28,6 +28,7 @@ do, and never imports Airflow. The ``.native`` file is JSON; its keys choose wha
 * ``sleep``: seconds to wait after the request arrives.
 * ``invalid``: return Dags that do not deserialize.
 * ``import_errors``: import errors to return, keyed as the runtime keys them.
+* ``pid_file``: a file to write the runtime's pid to.
 """
 
 from __future__ import annotations
@@ -124,6 +125,8 @@ def _build_payload(dag_id: str, *, fileloc: str, bundle_path: str, description: 
 
 def main() -> None:
     spec = json.loads(Path(sys.argv[1]).read_text())
+    if pid_file := spec.get("pid_file"):
+        Path(pid_file).write_text(str(os.getpid()))
     if (code := spec.get("exit_before_connect")) is not None:
         print("exiting before connecting", file=sys.stderr, flush=True)
         os._exit(code)

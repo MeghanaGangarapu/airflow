@@ -33,6 +33,7 @@ from socket import socketpair
 from typing import TYPE_CHECKING, Any, BinaryIO
 from unittest.mock import MagicMock, patch
 
+import psutil
 import pytest
 import structlog
 from pydantic import TypeAdapter
@@ -2877,6 +2878,22 @@ class TestLangSDKDagFileProcessorProcessRun:
         [proc] = [c.args[0] for c in mock_close.call_args_list]
         assert proc._exit_code == -signal.SIGKILL
         assert not proc._open_sockets
+
+    def test_a_timeout_kills_a_runtime_that_a_launcher_started(self, tmp_path):
+        pid_file = tmp_path / "runtime.pid"
+
+        with pytest.raises(TimeoutError):
+            self._run(
+                tmp_path, dags=["native_dag"], sleep=30, launcher=True, pid_file=str(pid_file), timeout=2
+            )
+
+        runtime = psutil.Process(int(pid_file.read_text()))
+        deadline = time.monotonic() + 10
+        while runtime.is_running() and runtime.status() != psutil.STATUS_ZOMBIE:
+            if time.monotonic() > deadline:
+                runtime.kill()
+                pytest.fail("the runtime outlived its launcher")
+            time.sleep(0.1)
 
     @patch.object(
         LangSDKDagFileProcessorProcess,
