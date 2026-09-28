@@ -33,6 +33,7 @@ from socket import socket, socketpair
 from typing import TYPE_CHECKING, Annotated, Any, BinaryIO, ClassVar, Literal, NoReturn, cast
 
 import attrs
+import msgspec
 import psutil
 from pydantic import BaseModel, Field, TypeAdapter
 from uuid6 import uuid7
@@ -1065,13 +1066,21 @@ class LangSDKDagFileProcessorProcess(DagFileProcessorProcess):
     def _register_comm(self, conn: socket) -> None:
         self.stdin = conn
         self._open_sockets[conn] = "requests"
-        self.selector.register(
-            conn,
-            selectors.EVENT_READ,
-            length_prefixed_frame_reader(
-                self.handle_requests(self.process_log), on_close=self._on_socket_closed
-            ),
+        read_frame, on_close = length_prefixed_frame_reader(
+            self.handle_requests(self.process_log), on_close=self._on_socket_closed
         )
+
+        def read_valid_frame(sock: socket) -> bool:
+            # A frame that does not decode would otherwise escape the Dag processor's selector loop.
+            try:
+                return read_frame(sock)
+            except msgspec.DecodeError as e:
+                self._set_import_error(f"The Lang-SDK runtime sent an invalid frame: {e}")
+                with contextlib.suppress(psutil.Error, ProcessLookupError):
+                    self._signal_subprocess(signal.SIGKILL)
+                return False
+
+        self.selector.register(conn, selectors.EVENT_READ, (read_valid_frame, on_close))
         self._send_parse_request()
 
     def _register_logs(self, conn: socket) -> None:

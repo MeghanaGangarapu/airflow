@@ -2746,6 +2746,23 @@ class TestLangSDKDagFileProcessorProcess:
             "ValueError: Cycle detected in Dag 'cyclic_dag'. Faulty task: 'extract'"
         }
 
+    @pytest.mark.parametrize(
+        ("frame", "error"),
+        [
+            pytest.param("00000003c1c1c1", "MessagePack data is malformed", id="malformed-msgpack"),
+            pytest.param("0000000481a16101", "Expected `array`, got `object`", id="not-a-frame"),
+        ],
+    )
+    def test_an_invalid_frame_is_an_import_error(self, start, selector, frame, error):
+        proc = start(dags=["native_dag"], raw_frames=[frame])
+
+        _service_until_ready(proc, selector)
+
+        [message] = proc.parsing_result.import_errors.values()
+        assert message.startswith("The Lang-SDK runtime sent an invalid frame: ")
+        assert error in message
+        assert proc._exit_code == -signal.SIGKILL
+
     def test_runtime_import_errors_are_kept(self, start, selector):
         proc = start(dags=[], import_errors={"dag.native": "native Dag failed"})
 

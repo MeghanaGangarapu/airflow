@@ -30,6 +30,7 @@ do, and never imports Airflow. The ``.native`` file is JSON; its keys choose wha
 * ``cyclic``: return Dags whose task depends on itself.
 * ``import_errors``: import errors to return, keyed as the runtime keys them.
 * ``pid_file``: a file to write the runtime's pid to.
+* ``raw_frames``: hex-encoded bytes to send on comm before replying.
 """
 
 from __future__ import annotations
@@ -148,6 +149,9 @@ def main() -> None:
 
     request_id, request = _receive_frame(comm)[:2]
     time.sleep(spec.get("sleep", 0))
+
+    for frame in spec.get("raw_frames", []):
+        comm.sendall(bytes.fromhex(frame))
 
     reply = None
     if key := spec.get("get_variable"):

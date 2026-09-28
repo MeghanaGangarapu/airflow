@@ -1733,6 +1733,25 @@ class TestDagFileProcessorManager:
             )
         ]
 
+    def test_an_invalid_frame_does_not_stop_other_files_parsing(self, tmp_path, configure_testing_dag_bundle):
+        write_native_file(tmp_path / "garbage.native", dags=["native_dag"], raw_frames=["00000003c1c1c1"])
+        (tmp_path / "python_dag.py").write_text(
+            "from airflow.sdk import DAG\nfrom airflow.sdk.bases.operator import BaseOperator\n\n"
+            'with DAG("python_dag", schedule=None):\n    BaseOperator(task_id="task")\n'
+        )
+
+        with fake_coordinator(), configure_testing_dag_bundle(tmp_path):
+            DagFileProcessorManager(max_runs=1, processor_timeout=60).run()
+
+        with create_session() as session:
+            dag_ids = session.scalars(select(SerializedDagModel.dag_id)).all()
+            import_errors = session.scalars(select(ParseImportError)).all()
+
+        assert dag_ids == ["python_dag"]
+        [import_error] = import_errors
+        assert import_error.filename == "garbage.native"
+        assert import_error.stacktrace.startswith("The Lang-SDK runtime sent an invalid frame: ")
+
     def test_terminate_orphan_processes_kills_then_closes_processor(self):
         manager = DagFileProcessorManager(max_runs=1)
         processor, _ = self.mock_processor()
